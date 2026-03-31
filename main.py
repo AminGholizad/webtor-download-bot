@@ -180,7 +180,7 @@ def main():
         print("Usage: uv run script.py --file links.txt '~/downloads'")
         return
 
-    target_folder = "~/downloads"
+    target_folder = os.path.expanduser("~/Downloads")
     magnets = []
 
     if sys.argv[1] in ["--file", "-f"]:
