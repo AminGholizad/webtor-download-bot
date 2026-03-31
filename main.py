@@ -190,7 +190,9 @@ def main():
             print(f"File not found: {file_path}")
             return
         with open(file_path, "r") as f:
-            magnets = [line.strip() for line in f if line.strip().startswith("magnet:")]
+            magnets = list(
+                set(line.strip() for line in f if line.strip().startswith("magnet:"))
+            )
     else:
         magnets = [sys.argv[1]]
         target_folder = sys.argv[2] if len(sys.argv) > 2 else target_folder
