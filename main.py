@@ -18,7 +18,10 @@ MAX_CONCURRENT_DOWNLOADS = 3
 
 
 def extract_and_cleanup(zip_path, pbar):
-    """Unzips the file and updates the progress bar description. And deletes the original ZIP."
+    """
+    Unzips the file member-by-member to ignore CRC errors
+    and deletes the original ZIP.
+    """
     if not os.path.exists(zip_path):
         print(f"❌ Extraction failed: {zip_path} not found.")
         return
@@ -27,18 +30,32 @@ def extract_and_cleanup(zip_path, pbar):
     extract_to = zip_path.rsplit(".", 1)[0]
     pbar.set_description(f"📦 Extracting: {os.path.basename(extract_to)[:20]}...")
     print(f"📦 Extracting to: {extract_to}...")
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(extract_to)
-        print("✅ Extraction complete.")
 
-        # Delete the zip file
+
+    if not os.path.exists(extract_to):
+        os.makedirs(extract_to)
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                try:
+                    # Extract individual file
+                    zf.extract(member, extract_to)
+                except (zipfile.BadZipFile, RuntimeError) as e:
+                    # This catches CRC errors or decryption errors per-file
+                    print(
+                        f"\n⚠️ Skipping corrupt file inside ZIP ({member.filename}): {e}"
+                    )
+                    continue
+
+        # We delete the ZIP even if some internal files were corrupt,
+        # as requested ("ignore CRC check error after extraction completed").
         os.remove(zip_path)
         print(f"🗑️ Deleted original ZIP: {zip_path}")
-    except zipfile.BadZipFile:
-        print("❌ Error: The downloaded file is not a valid ZIP or is corrupted.")
+        pbar.set_description(f"✅ Finished: {os.path.basename(extract_to)[:20]}")
+
     except Exception as e:
-        print(f"\n❌ Extraction error: {e}")
+        print(f"\n❌ Critical ZIP Error: {e}")
 
 
 def run_curl_with_progress(raw_command, target_dir, magnet_index):
@@ -76,18 +93,17 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
         leave=False,
     )
 
-    # We use stdbuf to ensure curl outputs line-by-line so we can parse progress
-    # We look for the percentage in curl's stderr
     process = subprocess.Popen(
         fixed_command,
         shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
 
     for line in iter(process.stdout.readline, ""):
-        # Regex to find percentage in curl progress meter (e.g., " 15 ")
+        # Matches the percentage in curl's default progress meter
         progress_match = re.search(r"(\d+)\s+[\d.]+[kMG]", line)
         if progress_match:
             percent = int(progress_match.group(1))
@@ -95,33 +111,35 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
             pbar.refresh()
 
     process.wait()
-    pbar.close()
 
-    if process.returncode == 0:
+    if (
+        process.returncode == 0 or process.returncode == 18
+    ):  # 18 is 'partial file' but often workable
         extract_and_cleanup(full_path, pbar)
     else:
-        print(f"\n⚠️ Download failed for {clean_filename}")
+        print(
+            f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
+        )
+
+    pbar.close()
 
 
 def process_magnet(magnet_link, download_path, index):
-    """Grabs the curl command and hands it to the downloader."""
-    # Unique session per thread to avoid Playwright lock errors
-    user_data_dir = f"./temp_session_{index}"
+    """Automates Webtor to get the curl command."""
+    # Unique session folder to prevent Playwright conflicts
+    user_data_dir = f"./session_thread_{index}"
 
     with sync_playwright() as p:
         stealth = Stealth()
-
-        context = p.chromium.launch_persistent_context(
-            user_data_dir,
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            permissions=["clipboard-read", "clipboard-write"],
-        )
-
-        page = context.pages[0]
-        stealth.apply_stealth_sync(page)
-
         try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            page = context.pages[0]
+            stealth.apply_stealth_sync(page)
             print(f"🌐 Opening Webtor.io...")
             page.goto(
                 "https://webtor.io/", wait_until="domcontentloaded", timeout=60000
@@ -148,15 +166,14 @@ def process_magnet(magnet_link, download_path, index):
             if captured_curl.startswith("curl"):
                 run_curl_with_progress(captured_curl, download_path, index)
 
-            # Cleanup temp session
+        except Exception as e:
+            print(f"\n❌ Link {index} Error: {e}")
+        finally:
+            # Clean up the temporary session folder
             import shutil
 
             if os.path.exists(user_data_dir):
-                shutil.rmtree(user_data_dir)
-
-        except Exception as e:
-            print(f"\n❌ Automation Error (Link {index}): {e}")
-            context.close()
+                shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 def main():
@@ -170,26 +187,30 @@ def main():
     if sys.argv[1] in ["--file", "-f"]:
         file_path = sys.argv[2]
         target_folder = sys.argv[3] if len(sys.argv) > 3 else target_folder
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            return
         with open(file_path, "r") as f:
             magnets = [line.strip() for line in f if line.strip().startswith("magnet:")]
     else:
         magnets = [sys.argv[1]]
         target_folder = sys.argv[2] if len(sys.argv) > 2 else target_folder
 
-    print(f"📦 Processing {len(magnets)} links...")
+    print(
+        f"⚙️ Starting {len(magnets)} downloads (Parallel Max: {MAX_CONCURRENT_DOWNLOADS})"
+    )
 
-    # Use ThreadPool to run the browser and download logic in parallel
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_DOWNLOADS
     ) as executor:
-        # Enumerate gives us an 'index' to position the progress bars
+        # We pass 'index' to position=index in tqdm so bars stack correctly
         futures = [
             executor.submit(process_magnet, m, target_folder, i)
             for i, m in enumerate(magnets)
         ]
         concurrent.futures.wait(futures)
 
-    print("\n🏁 All downloads completed.")
+    print("\n🏁 Process finished.")
 
 
 if __name__ == "__main__":
