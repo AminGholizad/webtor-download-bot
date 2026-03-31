@@ -124,7 +124,7 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
 
 
 def process_magnet(magnet_link, download_path, index):
-    """Automates Webtor to get the curl command using browser-level clipboard isolation."""
+    """Automates Webtor by intercepting the internal download data, bypassing the clipboard."""
     user_data_dir = f"./session_thread_{index}"
 
     with sync_playwright() as p:
@@ -136,12 +136,10 @@ def process_magnet(magnet_link, download_path, index):
                 args=["--disable-blink-features=AutomationControlled"],
             )
 
-            # CRITICAL: Grant clipboard permissions to the browser context
-            context.grant_permissions(["clipboard-read", "clipboard-write"])
-
             page = context.pages[0]
             stealth.apply_stealth_sync(page)
-            print(f"🌐 Opening Webtor.io...")
+
+            print(f"🌐 [{index}] Processing Link...")
             page.goto(
                 "https://webtor.io/", wait_until="domcontentloaded", timeout=60000
             )
@@ -151,25 +149,50 @@ def process_magnet(magnet_link, download_path, index):
             search_input.fill(magnet_link)
             search_input.press("Enter")
 
+            # Wait for the ZIP button to appear
             zip_selector = "button:has-text('ZIP')"
             print("⏳ Waiting for ZIP button (fetching metadata)...")
             page.wait_for_selector(zip_selector, timeout=180000)
-            page.click(zip_selector)
 
-            curl_btn = "text='copy curl cmd'"
-            page.wait_for_selector(curl_btn, timeout=30000)
-            page.click(curl_btn)
+            # --- THE CLIPBOARD BYPASS ---
+            # Instead of clicking 'Copy curl', we extract the 'share' or 'download' data
+            # directly from the button's attributes or the page's internal state.
+            # Webtor stores the curl command in a hidden attribute or generates it via JS.
 
-            # NEW WAY: Read from browser clipboard, NOT system clipboard
-            time.sleep(2)
-            captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
+            print(f"🧬 [{index}] Extracting command...")
+
+            # We trigger the 'Copy' logic but intercept the result immediately
+            # via a JavaScript injection that returns the string directly to Python.
+            captured_curl = page.evaluate("""
+                () => {
+                    const btn = document.querySelector("button:contains('copy curl cmd')") ||
+                                document.querySelector("button i.fa-terminal").closest('button');
+                    if (btn) {
+                        // We simulate the click but return the 'value' it would have copied
+                        // This uses the internal app's state if available
+                        return window.app?.$store?.state?.download?.curl || null;
+                    }
+                    return null;
+                }
+            """)
+
+            # IF the internal state trick fails, we use the "Listener" trick:
+            if not captured_curl:
+                # We overwrite the clipboard API in this specific page so that
+                # when the button 'writes' to it, it returns the string to us instead.
+                page.evaluate(
+                    "navigator.clipboard.writeText = (text) => { window.capturedText = text; }"
+                )
+                page.click("text='copy curl cmd'")
+                time.sleep(1)
+                captured_curl = page.evaluate("window.capturedText")
 
             context.close()
 
             if captured_curl and captured_curl.startswith("curl"):
                 run_curl_with_progress(captured_curl, download_path, index)
             else:
-                print(f"❌ Thread {index}: Failed to grab curl from browser clipboard.")
+                print(f"❌ Thread {index}: Could not capture CURL command.")
 
         except Exception as e:
             print(f"\n❌ Link {index} Error: {e}")
