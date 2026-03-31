@@ -124,8 +124,7 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
 
 
 def process_magnet(magnet_link, download_path, index):
-    """Automates Webtor to get the curl command."""
-    # Unique session folder to prevent Playwright conflicts
+    """Automates Webtor to get the curl command using browser-level clipboard isolation."""
     user_data_dir = f"./session_thread_{index}"
 
     with sync_playwright() as p:
@@ -135,8 +134,11 @@ def process_magnet(magnet_link, download_path, index):
                 user_data_dir,
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
-                permissions=["clipboard-read", "clipboard-write"],
             )
+
+            # CRITICAL: Grant clipboard permissions to the browser context
+            context.grant_permissions(["clipboard-read", "clipboard-write"])
+
             page = context.pages[0]
             stealth.apply_stealth_sync(page)
             print(f"🌐 Opening Webtor.io...")
@@ -158,12 +160,16 @@ def process_magnet(magnet_link, download_path, index):
             page.wait_for_selector(curl_btn, timeout=30000)
             page.click(curl_btn)
 
+            # NEW WAY: Read from browser clipboard, NOT system clipboard
             time.sleep(2)
-            captured_curl = pyperclip.paste().strip()
+            captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
+
             context.close()
 
-            if captured_curl.startswith("curl"):
+            if captured_curl and captured_curl.startswith("curl"):
                 run_curl_with_progress(captured_curl, download_path, index)
+            else:
+                print(f"❌ Thread {index}: Failed to grab curl from browser clipboard.")
 
         except Exception as e:
             print(f"\n❌ Link {index} Error: {e}")
