@@ -133,7 +133,7 @@ def process_magnet(magnet_link, download_path, index):
         try:
             context = p.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=True,
+                headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
                 permissions=["clipboard-read", "clipboard-write"],
             )
