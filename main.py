@@ -31,7 +31,6 @@ def extract_and_cleanup(zip_path, pbar):
     pbar.set_description(f"📦 Extracting: {os.path.basename(extract_to)[:20]}...")
     print(f"📦 Extracting to: {extract_to}...")
 
-
     if not os.path.exists(extract_to):
         os.makedirs(extract_to)
 
@@ -60,7 +59,7 @@ def extract_and_cleanup(zip_path, pbar):
 
 def run_curl_with_progress(raw_command, target_dir, magnet_index):
     """Executes curl and maps its output to a tqdm progress bar."""
-    
+
     target_dir = os.path.abspath(target_dir)
     if not os.path.exists(target_dir):
         os.makedirs(target_dir, exist_ok=True)
@@ -70,8 +69,8 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
 
     if not match:
         print(
-                       f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
-                   )
+            f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
+        )
         subprocess.run(raw_command, shell=True)
         return
 
@@ -178,10 +177,10 @@ def process_magnet(magnet_link, download_path, index):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: uv run script.py --file links.txt './downloads'")
+        print("Usage: uv run script.py --file links.txt '~/downloads'")
         return
 
-    target_folder = "./downloads"
+    target_folder = "~/downloads"
     magnets = []
 
     if sys.argv[1] in ["--file", "-f"]:
