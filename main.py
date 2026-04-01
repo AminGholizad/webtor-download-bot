@@ -38,7 +38,6 @@ def extract_and_cleanup(zip_path, pbar):
         with zipfile.ZipFile(zip_path, "r") as zf:
             for member in zf.infolist():
                 try:
-                    # Extract individual file
                     zf.extract(member, extract_to)
                 except (zipfile.BadZipFile, RuntimeError) as e:
                     # This catches CRC errors or decryption errors per-file
@@ -57,16 +56,13 @@ def extract_and_cleanup(zip_path, pbar):
         print(f"\n❌ Critical ZIP Error: {e}")
 
 
-def run_curl_with_progress(raw_command, target_dir, magnet_index):
-    """Executes curl and maps its output to a tqdm progress bar."""
-
+def run_curl_download(raw_command, target_dir, pbar_index):
+    """The background worker that handles the actual download."""
     target_dir = os.path.abspath(target_dir)
-    if not os.path.exists(target_dir):
-        os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
 
     pattern = r'-o\s+"([^"]+)"'
     match = re.search(pattern, raw_command)
-
     if not match:
         print(
             f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
@@ -79,6 +75,8 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
     full_path = os.path.join(target_dir, clean_filename)
     fixed_command = raw_command.replace(f'"{encoded_filename}"', f'"{full_path}"', 1)
 
+    # Pre-inject Resume and Path
+    fixed_command = raw_command.replace(f'"{encoded_filename}"', f'"{full_path}"', 1)
     if "-C -" not in fixed_command:
         fixed_command = fixed_command.replace("curl", "curl -C -", 1)
 
@@ -88,7 +86,7 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
         total=100,
         desc=f"🚀 {clean_filename[:25]}",
         unit="%",
-        position=magnet_index,
+        position=pbar_index,
         leave=False,
     )
 
@@ -105,15 +103,11 @@ def run_curl_with_progress(raw_command, target_dir, magnet_index):
         # Matches the percentage in curl's default progress meter
         progress_match = re.search(r"(\d+)\s+[\d.]+[kMG]", line)
         if progress_match:
-            percent = int(progress_match.group(1))
-            pbar.n = percent
+            pbar.n = int(progress_match.group(1))
             pbar.refresh()
 
     process.wait()
-
-    if (
-        process.returncode == 0 or process.returncode == 18
-    ):  # 18 is 'partial file' but often workable
+    if process.returncode in [0, 18]:
         extract_and_cleanup(full_path, pbar)
     else:
         print(
@@ -206,7 +200,7 @@ def process_magnet(magnet_link, download_path, index):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: uv run script.py --file links.txt '~/downloads'")
+        print("Usage: xvfb-run --auto-servernum uv run main.py --file links.txt")
         return
 
     target_folder = os.path.expanduser("~/Downloads")
@@ -214,7 +208,8 @@ def main():
 
     if sys.argv[1] in ["--file", "-f"]:
         file_path = sys.argv[2]
-        target_folder = sys.argv[3] if len(sys.argv) > 3 else target_folder
+        if len(sys.argv) > 3:
+            target_folder = sys.argv[3] 
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
             return
@@ -224,23 +219,66 @@ def main():
             )
     else:
         magnets = [sys.argv[1]]
-        target_folder = sys.argv[2] if len(sys.argv) > 2 else target_folder
+        if len(sys.argv) > 2:
+            target_folder = os.path.expanduser(sys.argv[2])
 
-    print(
-        f"⚙️ Starting {len(magnets)} downloads (Parallel Max: {MAX_CONCURRENT_DOWNLOADS})"
-    )
+    print(f"⚙️ Found {len(magnets)} unique links. Starting Sequential Scraper...")
 
+    # Shared pool for background downloads
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_DOWNLOADS
     ) as executor:
-        # We pass 'index' to position=index in tqdm so bars stack correctly
-        futures = [
-            executor.submit(process_magnet, m, target_folder, i)
-            for i, m in enumerate(magnets)
-        ]
-        concurrent.futures.wait(futures)
+        with sync_playwright() as p:
+            # Single browser context for everything
+            context = p.chromium.launch_persistent_context(
+                "./webtor_session",
+                headless=False,  # xvfb handles this
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = context.pages[0]
+            Stealth().apply_stealth_sync(page)
 
-    print("\n🏁 Process finished.")
+            for i, m in enumerate(magnets):
+                try:
+                    print(
+                        f"🌐 [{i + 1}/{len(magnets)}] Fetching command from Webtor..."
+                    )
+                    page.goto("https://webtor.io/", wait_until="domcontentloaded")
+
+                    search_input = page.wait_for_selector(
+                        'input[placeholder*="magnet"]'
+                    )
+                    search_input.fill(m)
+                    search_input.press("Enter")
+
+                    zip_btn = page.wait_for_selector(
+                        "button:has-text('ZIP')", timeout=180000
+                    )
+                    zip_btn.click()
+
+                    copy_btn = page.wait_for_selector(
+                        "text='copy curl cmd'", timeout=30000
+                    )
+                    copy_btn.click()
+
+                    time.sleep(2)  # Safe clipboard buffer
+                    captured_curl = pyperclip.paste().strip()
+
+                    if captured_curl.startswith("curl"):
+                        # Submit to background thread and move to NEXT magnet immediately
+                        executor.submit(
+                            run_curl_download, captured_curl, target_folder, i
+                        )
+                    else:
+                        print(f"❌ Failed to grab command for link {i + 1}")
+
+                except Exception as e:
+                    print(f"❌ Error on link {i + 1}: {e}")
+
+            print("✔ All links scraped. Browser closing. Downloads continuing...")
+            context.close()
+
+    print("\n🏁 All background tasks finished.")
 
 
 if __name__ == "__main__":
