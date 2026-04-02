@@ -57,7 +57,7 @@ def extract_and_cleanup(zip_path, pbar):
 
 
 def run_curl_download(raw_command, target_dir, pbar_index):
-    """The background worker that handles the actual download."""
+    """The background worker with a cleaner 'Size/Total' UI."""
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
@@ -73,21 +73,23 @@ def run_curl_download(raw_command, target_dir, pbar_index):
     encoded_filename = match.group(1)
     clean_filename = unquote(encoded_filename)
     full_path = os.path.join(target_dir, clean_filename)
-    fixed_command = raw_command.replace(f'"{encoded_filename}"', f'"{full_path}"', 1)
 
-    # Pre-inject Resume and Path
     fixed_command = raw_command.replace(f'"{encoded_filename}"', f'"{full_path}"', 1)
     if "-C -" not in fixed_command:
         fixed_command = fixed_command.replace("curl", "curl -C -", 1)
 
     # Initialize TQDM bar for this specific download
     # position=magnet_index allows multiple bars to stack correctly
+    # UI SETUP:
+    # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
     pbar = tqdm(
         total=100,
-        desc=f"🚀 {clean_filename[:25]}",
-        unit="%",
+        desc=f"🚀 {clean_filename[:20]}",
+        unit="B",
+        unit_scale=True,
         position=pbar_index,
         leave=False,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     )
 
     process = subprocess.Popen(
@@ -99,11 +101,31 @@ def run_curl_download(raw_command, target_dir, pbar_index):
         bufsize=1,
     )
 
+    total_bytes = 0
+
     for line in iter(process.stdout.readline, ""):
-        # Matches the percentage in curl's default progress meter
-        progress_match = re.search(r"(\d+)\s+[\d.]+[kMG]", line)
-        if progress_match:
-            pbar.n = int(progress_match.group(1))
+        # 1. Try to find the total size from curl's header (e.g., 1.2G or 500M)
+        if total_bytes == 0:
+            # Look for the 'Total' column in the curl progress meter
+            size_match = re.search(r"(\d+(?:\.\d+)?[kMG])", line)
+            if size_match:
+                raw_size = size_match.group(1)
+                # Convert human-readable size to approximate bytes for the progress bar
+                multipliers = {"k": 1024, "M": 1024**2, "G": 1024**3}
+                val = float(re.sub(r"[kMG]", "", raw_size))
+                unit = raw_size[-1]
+                total_bytes = int(val * multipliers.get(unit, 1))
+                pbar.total = total_bytes
+
+        # 2. Extract percentage and update the 'n' (current bytes)
+        progress_match = re.search(
+            r"(\d+)\s+([\d.]+[kMG])\s+(\d+)\s+([\d.]+[kMG])", line
+        )
+        if progress_match and total_bytes > 0:
+            percent = int(progress_match.group(1))
+            # Calculate current bytes based on percentage
+            current_bytes = int((percent / 100) * total_bytes)
+            pbar.n = current_bytes
             pbar.refresh()
 
     process.wait()
@@ -117,87 +139,6 @@ def run_curl_download(raw_command, target_dir, pbar_index):
     pbar.close()
 
 
-def process_magnet(magnet_link, download_path, index):
-    """Automates Webtor by intercepting the internal download data, bypassing the clipboard."""
-    user_data_dir = f"./session_thread_{index}"
-
-    with sync_playwright() as p:
-        stealth = Stealth()
-        try:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-
-            page = context.pages[0]
-            stealth.apply_stealth_sync(page)
-
-            print(f"🌐 [{index}] Processing Link...")
-            page.goto(
-                "https://webtor.io/", wait_until="domcontentloaded", timeout=60000
-            )
-            search_input = page.wait_for_selector(
-                'input[placeholder*="magnet"]', timeout=30000
-            )
-            search_input.fill(magnet_link)
-            search_input.press("Enter")
-
-            # Wait for the ZIP button to appear
-            zip_selector = "button:has-text('ZIP')"
-            print("⏳ Waiting for ZIP button (fetching metadata)...")
-            page.wait_for_selector(zip_selector, timeout=180000)
-
-            # --- THE CLIPBOARD BYPASS ---
-            # Instead of clicking 'Copy curl', we extract the 'share' or 'download' data
-            # directly from the button's attributes or the page's internal state.
-            # Webtor stores the curl command in a hidden attribute or generates it via JS.
-
-            print(f"🧬 [{index}] Extracting command...")
-
-            # We trigger the 'Copy' logic but intercept the result immediately
-            # via a JavaScript injection that returns the string directly to Python.
-            captured_curl = page.evaluate("""
-                () => {
-                    const btn = document.querySelector("button:contains('copy curl cmd')") ||
-                                document.querySelector("button i.fa-terminal").closest('button');
-                    if (btn) {
-                        // We simulate the click but return the 'value' it would have copied
-                        // This uses the internal app's state if available
-                        return window.app?.$store?.state?.download?.curl || null;
-                    }
-                    return null;
-                }
-            """)
-
-            # IF the internal state trick fails, we use the "Listener" trick:
-            if not captured_curl:
-                # We overwrite the clipboard API in this specific page so that
-                # when the button 'writes' to it, it returns the string to us instead.
-                page.evaluate(
-                    "navigator.clipboard.writeText = (text) => { window.capturedText = text; }"
-                )
-                page.click("text='copy curl cmd'")
-                time.sleep(1)
-                captured_curl = page.evaluate("window.capturedText")
-
-            context.close()
-
-            if captured_curl and captured_curl.startswith("curl"):
-                run_curl_with_progress(captured_curl, download_path, index)
-            else:
-                print(f"❌ Thread {index}: Could not capture CURL command.")
-
-        except Exception as e:
-            print(f"\n❌ Link {index} Error: {e}")
-        finally:
-            # Clean up the temporary session folder
-            import shutil
-
-            if os.path.exists(user_data_dir):
-                shutil.rmtree(user_data_dir, ignore_errors=True)
-
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: xvfb-run --auto-servernum uv run main.py --file links.txt")
@@ -209,7 +150,7 @@ def main():
     if sys.argv[1] in ["--file", "-f"]:
         file_path = sys.argv[2]
         if len(sys.argv) > 3:
-            target_folder = sys.argv[3] 
+            target_folder = sys.argv[3]
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
             return
