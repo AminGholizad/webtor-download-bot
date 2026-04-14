@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import threading
 from urllib.parse import unquote
 
 import pyperclip
@@ -14,7 +15,18 @@ from tqdm import tqdm
 
 # --- SETTINGS ---
 MAX_CONCURRENT_DOWNLOADS = 3
+FAILED_LINKS_FILE = "failed_links.txt"
 # ----------------
+
+# Thread lock to prevent multiple threads from writing to the file at once
+file_lock = threading.Lock()
+
+
+def log_failure(magnet_link):
+    """Appends a failed magnet link to the failure file."""
+    with file_lock:
+        with open(FAILED_LINKS_FILE, "a") as f:
+            f.write(f"{magnet_link}\n")
 
 
 def extract_and_cleanup(zip_path, pbar):
@@ -56,14 +68,14 @@ def extract_and_cleanup(zip_path, pbar):
         print(f"\n❌ Critical ZIP Error: {e}")
 
 
-def run_curl_download(raw_command, target_dir, pbar_index):
+def run_curl_download(raw_command, target_dir, pbar_index, original_magnet):
     """The background worker with a cleaner 'Size/Total' UI."""
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
-    pattern = r'-o\s+"([^"]+)"'
-    match = re.search(pattern, raw_command)
+    match = re.search(r'-o\s+"([^"]+)"', raw_command)
     if not match:
+        log_failure(original_magnet)
         print(
             f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
         )
@@ -102,22 +114,17 @@ def run_curl_download(raw_command, target_dir, pbar_index):
     )
 
     total_bytes = 0
-
     for line in iter(process.stdout.readline, ""):
-        # 1. Try to find the total size from curl's header (e.g., 1.2G or 500M)
         if total_bytes == 0:
-            # Look for the 'Total' column in the curl progress meter
             size_match = re.search(r"(\d+(?:\.\d+)?[kMG])", line)
             if size_match:
                 raw_size = size_match.group(1)
-                # Convert human-readable size to approximate bytes for the progress bar
                 multipliers = {"k": 1024, "M": 1024**2, "G": 1024**3}
                 val = float(re.sub(r"[kMG]", "", raw_size))
                 unit = raw_size[-1]
                 total_bytes = int(val * multipliers.get(unit, 1))
                 pbar.total = total_bytes
 
-        # 2. Extract percentage and update the 'n' (current bytes)
         progress_match = re.search(
             r"(\d+)\s+([\d.]+[kMG])\s+(\d+)\s+([\d.]+[kMG])", line
         )
@@ -132,10 +139,10 @@ def run_curl_download(raw_command, target_dir, pbar_index):
     if process.returncode in [0, 18]:
         extract_and_cleanup(full_path, pbar)
     else:
+        log_failure(original_magnet)
         print(
             f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
         )
-
     pbar.close()
 
 
@@ -163,7 +170,7 @@ def main():
         if len(sys.argv) > 2:
             target_folder = os.path.expanduser(sys.argv[2])
 
-    print(f"⚙️ Found {len(magnets)} unique links. Starting Sequential Scraper...")
+    print(f"⚙️ Found {len(magnets)} unique links. Opening scraper...")
 
     # Shared pool for background downloads
     with concurrent.futures.ThreadPoolExecutor(
@@ -208,18 +215,20 @@ def main():
                     if captured_curl.startswith("curl"):
                         # Submit to background thread and move to NEXT magnet immediately
                         executor.submit(
-                            run_curl_download, captured_curl, target_folder, i
+                            run_curl_download, captured_curl, target_folder, i, m
                         )
                     else:
                         print(f"❌ Failed to grab command for link {i + 1}")
+                        log_failure(m)
 
                 except Exception as e:
                     print(f"❌ Error on link {i + 1}: {e}")
+                    log_failure(m)
 
             print("✔ All links scraped. Browser closing. Downloads continuing...")
             context.close()
 
-    print("\n🏁 All background tasks finished.")
+    print(f"\n🏁 Finished. Check '{FAILED_LINKS_FILE}' if any failed.")
 
 
 if __name__ == "__main__":
