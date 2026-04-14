@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+
+webtor_session/
