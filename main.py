@@ -15,18 +15,56 @@ from tqdm import tqdm
 
 # --- SETTINGS ---
 MAX_CONCURRENT_DOWNLOADS = 3
-FAILED_LINKS_FILE = "failed_links.txt"
 # ----------------
 
-# Thread lock to prevent multiple threads from writing to the file at once
-file_lock = threading.Lock()
+# Lock to prevent file corruption during parallel status updates
+file_modify_lock = threading.Lock()
 
 
-def log_failure(magnet_link):
-    """Appends a failed magnet link to the failure file."""
-    with file_lock:
-        with open(FAILED_LINKS_FILE, "a") as f:
-            f.write(f"{magnet_link}\n")
+def cleanup_duplicates(file_path):
+    """Reads the file, removes duplicates, and rewrites it clean."""
+    if not file_path or not os.path.exists(file_path):
+        return []
+
+    with open(file_path, "r") as f:
+        lines = f.readlines()
+
+    # Filter only magnet lines and remove duplicates while preserving order
+    seen = set()
+    unique_magnets = []
+    for line in lines:
+        clean_line = line.strip()
+        if clean_line.startswith("magnet:") and clean_line not in seen:
+            unique_magnets.append(clean_line)
+            seen.add(clean_line)
+
+    # Rewrite the file with only unique magnets
+    with open(file_path, "w") as f:
+        for m in unique_magnets:
+            f.write(f"{m}\n")
+
+    return unique_magnets
+
+
+def update_link_status(file_path, magnet_link, status):
+    """Finds the magnet link line and appends status below it."""
+    if not file_path:
+        return
+
+    with file_modify_lock:
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+
+        new_lines = []
+        for line in lines:
+            new_lines.append(line)
+            # Check if this line is our magnet and doesn't already have this status
+            if magnet_link in line.strip():
+                # We add the status as an indented line
+                new_lines.append(f"   STATUS: {status}\n")
+
+        with open(file_path, "w") as f:
+            f.writelines(new_lines)
 
 
 def extract_and_cleanup(zip_path, pbar):
@@ -68,17 +106,18 @@ def extract_and_cleanup(zip_path, pbar):
         print(f"\n❌ Critical ZIP Error: {e}")
 
 
-def run_curl_download(raw_command, target_dir, pbar_index, original_magnet):
-    """The background worker with a cleaner 'Size/Total' UI."""
+def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file_path):
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
     match = re.search(r'-o\s+"([^"]+)"', raw_command)
     if not match:
-        log_failure(original_magnet)
-        print(
-            f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
+        update_link_status(
+            file_path, original_magnet, "FAILED: Could not parse curl command"
         )
+        print(
+                    f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
+                )
         subprocess.run(raw_command, shell=True)
         return
 
@@ -138,11 +177,14 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet):
     process.wait()
     if process.returncode in [0, 18]:
         extract_and_cleanup(full_path, pbar)
+        update_link_status(file_path, original_magnet, "DONE")
     else:
-        log_failure(original_magnet)
-        print(
-            f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
+        update_link_status(
+            file_path, original_magnet, f"FAILED: Curl Exit Code {process.returncode}"
         )
+        print(
+                    f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
+                )
     pbar.close()
 
 
@@ -152,25 +194,26 @@ def main():
         return
 
     target_folder = os.path.expanduser("~/Downloads")
+    source_file = None
     magnets = []
 
     if sys.argv[1] in ["--file", "-f"]:
-        file_path = sys.argv[2]
+        source_file = sys.argv[2]
         if len(sys.argv) > 3:
-            target_folder = sys.argv[3]
-        if not os.path.exists(file_path):
-            print(f"File not found: {file_path}")
-            return
-        with open(file_path, "r") as f:
-            magnets = list(
-                set(line.strip() for line in f if line.strip().startswith("magnet:"))
-            )
+            target_folder = os.path.expanduser(sys.argv[3])
+        # STEP 1: Cleanup duplicates in the actual file
+        print(f"🧹 Cleaning up duplicates in {source_file}...")
+        magnets = cleanup_duplicates(source_file)
     else:
         magnets = [sys.argv[1]]
         if len(sys.argv) > 2:
             target_folder = os.path.expanduser(sys.argv[2])
 
-    print(f"⚙️ Found {len(magnets)} unique links. Opening scraper...")
+    if not magnets:
+        print("No valid magnet links found.")
+        return
+
+    print(f"⚙️ Processing {len(magnets)} unique links.")
 
     # Shared pool for background downloads
     with concurrent.futures.ThreadPoolExecutor(
@@ -215,20 +258,25 @@ def main():
                     if captured_curl.startswith("curl"):
                         # Submit to background thread and move to NEXT magnet immediately
                         executor.submit(
-                            run_curl_download, captured_curl, target_folder, i, m
+                            run_curl_download,
+                            captured_curl,
+                            target_folder,
+                            i,
+                            m,
+                            source_file,
                         )
                     else:
+                        update_link_status(source_file, m, "FAILED: Scraping Error")
                         print(f"❌ Failed to grab command for link {i + 1}")
-                        log_failure(m)
 
                 except Exception as e:
                     print(f"❌ Error on link {i + 1}: {e}")
-                    log_failure(m)
+                    update_link_status(source_file, m, "FAILED: Timeout/UI Error")
 
             print("✔ All links scraped. Browser closing. Downloads continuing...")
             context.close()
 
-    print(f"\n🏁 Finished. Check '{FAILED_LINKS_FILE}' if any failed.")
+    print(f"\n🏁 Finished. Source file '{source_file}' updated.")
 
 
 if __name__ == "__main__":
