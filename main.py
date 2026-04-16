@@ -25,13 +25,16 @@ file_modify_lock = threading.Lock()
 def load_yaml(file_path):
     if not os.path.exists(file_path):
         return []
-    with open(file_path, "r") as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, list) else []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        return []
 
 
 def save_yaml(file_path, data):
-    with open(file_path, "w") as f:
+    with open(file_path, "w", encoding="utf-8") as f:
         # Use allow_unicode=True to preserve movie titles with special characters
         yaml.dump(
             data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
@@ -65,13 +68,12 @@ def extract_and_cleanup(zip_path, pbar):
     and deletes the original ZIP.
     """
     if not os.path.exists(zip_path):
-        print(f"❌ Extraction failed: {zip_path} not found.")
+        tqdm.write(f"❌ Extraction failed: {zip_path} not found.")
         return
 
     # Create a folder name based on the zip name (without .zip)
     extract_to = zip_path.rsplit(".", 1)[0]
-    pbar.set_description(f"📦 Extracting: {os.path.basename(extract_to)[:20]}...")
-    print(f"📦 Extracting to: {extract_to}...")
+    pbar.set_description(f"📦 Unzipping: {os.path.basename(extract_to)[:15]}")
 
     if not os.path.exists(extract_to):
         os.makedirs(extract_to)
@@ -83,7 +85,7 @@ def extract_and_cleanup(zip_path, pbar):
                     zf.extract(member, extract_to)
                 except (zipfile.BadZipFile, RuntimeError) as e:
                     # This catches CRC errors or decryption errors per-file
-                    print(
+                    tqdm.write(
                         f"\n⚠️ Skipping corrupt file inside ZIP ({member.filename}): {e}"
                     )
                     continue
@@ -91,13 +93,16 @@ def extract_and_cleanup(zip_path, pbar):
         # We delete the ZIP even if some internal files were corrupt,
         # as requested ("ignore CRC check error after extraction completed").
         os.remove(zip_path)
-        print(f"🗑️ Deleted original ZIP: {zip_path}")
+        tqdm.write(f"🗑️ Deleted original ZIP: {zip_path}")
         pbar.set_description(f"✅ Finished: {os.path.basename(extract_to)[:20]}")
     except Exception as e:
-        print(f"\n❌ Critical ZIP Error: {e}")
+        tqdm.write(f"❌ Critical ZIP extraction error: {e}")
 
 
-def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file_path):
+def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file_path):
+    """
+    slot_index determines the vertical position of the progress bar.
+    """
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
@@ -108,7 +113,7 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
             original_magnet,
             {"status": "FAILED: Could not parse curl command"},
         )
-        print(
+        tqdm.write(
             f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
         )
         subprocess.run(raw_command, shell=True)
@@ -123,7 +128,7 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
         fixed_command = fixed_command.replace("curl", "curl -C -", 1)
 
     # Initialize TQDM bar for this specific download
-    # position=magnet_index allows multiple bars to stack correctly
+    # position=slot_index + 1 to leave room for general logs at the top
     # UI SETUP:
     # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
     pbar = tqdm(
@@ -131,9 +136,10 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
         desc=f"🚀 {clean_filename[:20]}",
         unit="B",
         unit_scale=True,
-        position=pbar_index,
+        position=slot_index + 1,
         leave=False,
-        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        dynamic_ncols=True,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
     )
 
     process = subprocess.Popen(
@@ -175,7 +181,7 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
             original_magnet,
             {"status": f"FAILED: Curl Exit Code {process.returncode}"},
         )
-        print(
+        tqdm.write(
             f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
         )
 
@@ -210,32 +216,34 @@ def main():
     ]
 
     if not pending_items:
-        print("No pending items to process.")
+        tqdm.write("✅ All items are already marked DONE.")
         return
 
-    # Check which items need a browser (no curl_cmd saved yet)
-    items_needing_scrape = [i for i in pending_items if not i.get("curl_cmd")]
+    tqdm.write(f"⚙️ Found {len(pending_items)} pending items.")
 
-    print(f"⚙️ Processing {len(pending_items)} items from YAML.")
-    # Shared pool for background downloads
+    # We use a Semaphore to limit active downloads and manage bar slots
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_DOWNLOADS
     ) as executor:
-        # 1. Start downloads for items that ALREADY have a curl_cmd
-        for i, item in enumerate(pending_items):
+        current_slot = 0
+
+        # 1. Start cached commands
+        for item in pending_items:
             if item.get("curl_cmd"):
-                print(f"⚡ Using cached command for: {item.get('title')}")
+                tqdm.write(f"⚡ Using cached command for: {item.get('title')}")
                 executor.submit(
                     run_curl_download,
                     item["curl_cmd"],
                     target_folder,
-                    i,
+                    current_slot % MAX_CONCURRENT_DOWNLOADS,
                     item["magnet"],
                     source_file,
                 )
+                current_slot += 1
 
-        # 2. Scrape items that don't have a curl_cmd
-        if items_needing_scrape:
+        # 2. Scrape missing commands
+        items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
+        if items_to_scrape:
             with sync_playwright() as p:
                 context = p.chromium.launch_persistent_context(
                     "./webtor_session",
@@ -245,12 +253,12 @@ def main():
                 page = context.pages[0]
                 Stealth().apply_stealth_sync(page)
 
-                for i, item in enumerate(items_needing_scrape):
+                for item in items_to_scrape:
                     m = item["magnet"]
                     title = item.get("title", "Unknown")
 
                     try:
-                        print(f"🌐 Fetching Webtor CMD for: {title}")
+                        tqdm.write(f"🌐 Fetching Webtor CMD for: {title}")
                         page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
                         search_input = page.wait_for_selector(
@@ -282,24 +290,27 @@ def main():
                                 run_curl_download,
                                 captured_curl,
                                 target_folder,
-                                i,
+                                current_slot % MAX_CONCURRENT_DOWNLOADS,
                                 m,
                                 source_file,
                             )
+                            current_slot += 1
                         else:
                             update_yaml_field(
                                 source_file, m, {"status": "FAILED: Scraping Error"}
                             )
-                            print(f"❌ Failed to grab command for link {i + 1}")
+                            tqdm.write(f"❌ Failed to grab command for link {i + 1}")
 
                     except Exception as e:
-                        print(f"❌ Error on {title}: {e}")
+                        tqdm.write(f"❌ Error on {title}: {e}")
                         update_yaml_field(
                             source_file, m, {"status": "FAILED: Timeout/UI Error"}
                         )
 
-            print("✔ Scraping complete. Browser closed. Downloads running...")
-            context.close()
+                context.close()
+
+        tqdm.write("⏳ Scraping finished. Waiting for all downloads...")
+        executor.shutdown(wait=True)
 
     print("🏁 Processing finished.")
 
