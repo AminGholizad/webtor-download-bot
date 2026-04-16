@@ -3,12 +3,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import zipfile
-import threading
 from urllib.parse import unquote
 
 import pyperclip
+import yaml
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 from tqdm import tqdm
@@ -21,50 +22,38 @@ MAX_CONCURRENT_DOWNLOADS = 3
 file_modify_lock = threading.Lock()
 
 
-def cleanup_duplicates(file_path):
-    """Reads the file, removes duplicates, and rewrites it clean."""
-    if not file_path or not os.path.exists(file_path):
+def load_yaml(file_path):
+    if not os.path.exists(file_path):
         return []
-
     with open(file_path, "r") as f:
-        lines = f.readlines()
+        data = yaml.safe_load(f)
+    return data if isinstance(data, list) else []
 
-    # Filter only magnet lines and remove duplicates while preserving order
-    seen = set()
-    unique_magnets = []
-    for line in lines:
-        clean_line = line.strip()
-        if clean_line.startswith("magnet:") and clean_line not in seen:
-            unique_magnets.append(clean_line)
-            seen.add(clean_line)
 
-    # Rewrite the file with only unique magnets
+def save_yaml(file_path, data):
     with open(file_path, "w") as f:
-        for m in unique_magnets:
-            f.write(f"{m}\n")
-
-    return unique_magnets
+        # Use allow_unicode=True to preserve movie titles with special characters
+        yaml.dump(
+            data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
+        )
 
 
 def update_link_status(file_path, magnet_link, status):
-    """Finds the magnet link line and appends status below it."""
+    """Finds the dictionary in the list matching the magnet and updates its status."""
     if not file_path:
         return
 
     with file_modify_lock:
-        with open(file_path, "r") as f:
-            lines = f.readlines()
+        data = load_yaml(file_path)
+        updated = False
+        for entry in data:
+            if entry.get("magnet") == magnet_link:
+                entry["status"] = status
+                updated = True
+                break
 
-        new_lines = []
-        for line in lines:
-            new_lines.append(line)
-            # Check if this line is our magnet and doesn't already have this status
-            if magnet_link in line.strip():
-                # We add the status as an indented line
-                new_lines.append(f"   STATUS: {status}\n")
-
-        with open(file_path, "w") as f:
-            f.writelines(new_lines)
+        if updated:
+            save_yaml(file_path, data)
 
 
 def extract_and_cleanup(zip_path, pbar):
@@ -116,8 +105,8 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
             file_path, original_magnet, "FAILED: Could not parse curl command"
         )
         print(
-                    f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
-                )
+            f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
+        )
         subprocess.run(raw_command, shell=True)
         return
 
@@ -183,37 +172,43 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
             file_path, original_magnet, f"FAILED: Curl Exit Code {process.returncode}"
         )
         print(
-                    f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
-                )
+            f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
+        )
     pbar.close()
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: xvfb-run --auto-servernum uv run main.py --file links.txt")
+        print("Usage: xvfb-run --auto-servernum uv run main.py --file movies.yaml")
         return
 
     target_folder = os.path.expanduser("~/Downloads")
     source_file = None
-    magnets = []
+    all_entries = []
 
     if sys.argv[1] in ["--file", "-f"]:
         source_file = sys.argv[2]
         if len(sys.argv) > 3:
             target_folder = os.path.expanduser(sys.argv[3])
-        # STEP 1: Cleanup duplicates in the actual file
-        print(f"🧹 Cleaning up duplicates in {source_file}...")
-        magnets = cleanup_duplicates(source_file)
+        all_entries = load_yaml(source_file)
     else:
-        magnets = [sys.argv[1]]
+        # Fallback for single magnet string passed via CLI
+        all_entries = [{"magnet": sys.argv[1], "title": "Manual Entry"}]
         if len(sys.argv) > 2:
             target_folder = os.path.expanduser(sys.argv[2])
 
-    if not magnets:
-        print("No valid magnet links found.")
+    # filter items that aren't already DONE and have a magnet link
+    pending_items = [
+        item
+        for item in all_entries
+        if item.get("status") != "DONE" and item.get("magnet")
+    ]
+
+    if not pending_items:
+        print("No pending items to process.")
         return
 
-    print(f"⚙️ Processing {len(magnets)} unique links.")
+    print(f"⚙️ Processing {len(pending_items)} items from YAML.")
 
     # Shared pool for background downloads
     with concurrent.futures.ThreadPoolExecutor(
@@ -229,10 +224,13 @@ def main():
             page = context.pages[0]
             Stealth().apply_stealth_sync(page)
 
-            for i, m in enumerate(magnets):
+            for i, item in enumerate(pending_items):
+                m = item["magnet"]
+                title = item.get("title", "Unknown")
+
                 try:
                     print(
-                        f"🌐 [{i + 1}/{len(magnets)}] Fetching command from Webtor..."
+                        f"🌐 [{i + 1}/{len(pending_items)}] Fetching Webtor CMD for: {title}"
                     )
                     page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
@@ -270,10 +268,10 @@ def main():
                         print(f"❌ Failed to grab command for link {i + 1}")
 
                 except Exception as e:
-                    print(f"❌ Error on link {i + 1}: {e}")
+                    print(f"❌ Error on {title}: {e}")
                     update_link_status(source_file, m, "FAILED: Timeout/UI Error")
 
-            print("✔ All links scraped. Browser closing. Downloads continuing...")
+            print("✔ Scraping complete. Browser closed. Downloads running...")
             context.close()
 
     print(f"\n🏁 Finished. Source file '{source_file}' updated.")
