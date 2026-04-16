@@ -273,7 +273,7 @@ def main():
                         zip_btn.click()
 
                         copy_btn = page.wait_for_selector(
-                            "text='copy curl cmd'", timeout=30000
+                            "text='copy curl cmd'", timeout=100000
                         )
                         copy_btn.click()
 
