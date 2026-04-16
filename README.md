@@ -1,15 +1,16 @@
 # 📖 Webtor Parallel Downloader
 
-A high-performance Python script that automates **Webtor.io** to generate `curl` download commands for magnet links. It features a sequential browser scraper to avoid clipboard conflicts and a parallel background downloader with real-time progress bars.
+A high-performance Python automation tool managed by **uv** that transforms **Webtor.io** into a powerful CLI download manager. It features metadata-aware task management, command caching, and parallel background downloads with real-time progress tracking.
 
 ## ✨ Features
 
-* **Sequential Scraping**: One browser instance handles links one-by-one to ensure the system clipboard never gets "raced" or corrupted.
-* **Parallel Downloads**: Background workers download multiple files simultaneously using `curl`.
-* **Smart Resume**: Uses `curl -C -` to automatically resume interrupted downloads.
-* **Auto-Extraction**: Extracts ZIP files immediately upon completion and cleans up the original archive.
-* **CRC Resilience**: Bypasses CRC-32 check errors (common with Webtor's "on-the-fly" ZIP generation).
-* **Headless Support**: Designed to run on servers using `xvfb`.
+* **YAML-based Task Management**: Track your library with structured metadata (Title, Quality, Size, Magnet).
+* **Command Caching**: Automatically saves scraped `curl` commands to the YAML file. If you restart the script, it skips the browser phase and resumes downloads instantly.
+* **Smart Resuming**: Automatically injects `curl -C -` to pick up exactly where an interrupted download left off.
+* **Parallel Downloads**: Multi-threaded background workers handle up to `N` downloads simultaneously with stacked progress bars.
+* **Auto-Extraction & Cleanup**: Unzips archives immediately upon completion and deletes the original `.zip` to save disk space.
+* **CRC Resilience**: Bypasses Webtor's "on-the-fly" ZIP CRC-32 errors during extraction.
+* **Headless-Ready**: Optimized for servers using `xvfb` to bypass bot detection.
 * **Beautiful UI**: Stacked progress bars showing percentage, downloaded size, and transfer speed.
 
 ---
@@ -17,7 +18,7 @@ A high-performance Python script that automates **Webtor.io** to generate `curl`
 ## 🚀 Installation
 
 ### 1. Prerequisites
-Ensure you have Python 3.13+, `curl` installed on your system. The `xvfb` is also recommended to have headless mode while passing bot check.
+Ensure you have Python 3.13+ and `curl` installed. For headless environments (Linux servers), `xvfb` is required.
 
 ### 2. Setup with `uv` (Recommended)
 This script uses `uv` for ultra-fast dependency management.
@@ -25,7 +26,8 @@ This script uses `uv` for ultra-fast dependency management.
 # Install uv if you haven't
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install Playwright browsers
+# Sync dependencies and install browsers
+uv sync
 uv run playwright install chromium
 ```
 
@@ -37,56 +39,77 @@ playwright install chromium
 
 ---
 
+📂 YAML Structure
+
+The script expects a .yaml file for batch processing. This allows the bot to track which files are DONE and store the curl_cmd for future use.
+
+```YAML
+
+- title: Some Title
+  size: 1.21 GB
+  magnet: magnet:?xt=urn:btih:417EC...
+```
+  
+---
+
 ## 🛠 Usage
+
+### Batch Processing (Recommended)
+The script will iterate through the YAML, skip finished items, and download pending ones.
+```bash
+xvfb-run --auto-servernum uv run main.py --file links.yaml
+```
 
 ### Single Magnet Link
 ```bash
 xvfb-run --auto-servernum uv run main.py "magnet:?xt=urn:btih:..."
 ```
 
-### Batch Processing from File
-Create a `links.txt` with one magnet link per line:
-```bash
-xvfb-run --auto-servernum uv run main.py --file links.txt
-```
-
 ### Custom Download Folder
 The default is `~/Downloads`. To change it:
 ```bash
 xvfb-run --auto-servernum uv run main.py "magnet:?xt=urn:btih:..." "/path/to/custom/folder"
-xvfb-run --auto-servernum uv run main.py --file links.txt "/path/to/custom/folder"
+xvfb-run --auto-servernum uv run main.py --file links.yaml "/path/to/custom/folder"
 ```
 
-you can also use provided download.sh for convinence.
-
+### Convenience Script
+You can also use the provided `download.sh`:
 ```bash
 ./download.sh "magnet:?xt=urn:btih:..."
 ./download.sh "magnet:?xt=urn:btih:..." "/path/to/custom/folder"
-./download.sh  --file links.txt
-./download.sh  --file links.txt "/path/to/custom/folder"
+./download.sh  --file links.yaml
+./download.sh  --file links.yaml "/path/to/custom/folder"
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-You can adjust the following variables directly in `main.py`:
+Adjust these settings at the top of `main.py`:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `MAX_CONCURRENT_DOWNLOADS` | `3` | Number of files to download at the same time. |
-| `target_folder` | `~/Downloads` | The default directory for saved files. |
-| `time.sleep(2)` | `2` | Buffer for clipboard synchronization. |
+| `MAX_CONCURRENT_DOWNLOADS` | `3` | Number of simultaneous file transfers. |
+| `target_folder` | `~/Downloads` | Default directory if not specified in CLI. |
+
+---
+
+## 🧠 Logic Flow
+
+1.  **Load YAML**: Reads the list of links and identifies items where `status != "DONE"`.
+2.  **Check Cache**: If an item already has a `curl_cmd` saved in the YAML, it fires the download thread immediately.
+3.  **Scrape**: For items without a cached command, it opens Playwright, navigates Webtor, and extracts the curl command via the clipboard.
+4.  **Update YAML**: The `curl_cmd` is saved back to the file instantly so you never have to scrape it twice.
+5.  **Download & Extract**: `curl` handles the data transfer, and Python handles the unzipping and status updates.
 
 ---
 
 ## 📝 Important Notes
 
-* **First Run & Captchas**: If you encounter Cloudflare captchas, run the script once without `xvfb` on your local machine to solve the challenge. The session will be saved in `./webtor_session`.
+* **Progress Bars**: The UI uses `tqdm.write()` to ensure logs don't break the stacked progress bars. Ensure your terminal window is large enough to show one bar per concurrent download.
+* **Captchas**: If blocked by Cloudflare, run once on a local machine (without `xvfb`) to solve the challenge. The session is preserved in `./webtor_session`.
+* **Persistence**: Do not manually edit the `status` or `curl_cmd` fields in the YAML while the script is running.
 * **Webtor ZIPs**: This script ignores CRC errors. This is intentional, as Webtor generates ZIP footers dynamically, which often triggers false-positive corruption flags in standard extraction tools.
 * **Clipboard**: The script uses the system clipboard. Avoid copying/pasting other text while the **Scraper** phase (the part opening the browser) is active. Once the downloads start, you can use your clipboard freely.
 
 ---
-
-## 📜 License
-MIT License. Use responsibly.
