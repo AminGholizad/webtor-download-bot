@@ -38,8 +38,11 @@ def save_yaml(file_path, data):
         )
 
 
-def update_link_status(file_path, magnet_link, status):
-    """Finds the dictionary in the list matching the magnet and updates its status."""
+def update_yaml_field(file_path, magnet_link, updates: dict):
+    """
+    Updates multiple fields (like status and curl_cmd) for a specific magnet.
+    'updates' should be a dictionary like {'status': 'DONE', 'curl_cmd': '...'}
+    """
     if not file_path:
         return
 
@@ -48,7 +51,7 @@ def update_link_status(file_path, magnet_link, status):
         updated = False
         for entry in data:
             if entry.get("magnet") == magnet_link:
-                entry["status"] = status
+                entry.update(updates)
                 updated = True
                 break
 
@@ -90,7 +93,6 @@ def extract_and_cleanup(zip_path, pbar):
         os.remove(zip_path)
         print(f"🗑️ Deleted original ZIP: {zip_path}")
         pbar.set_description(f"✅ Finished: {os.path.basename(extract_to)[:20]}")
-
     except Exception as e:
         print(f"\n❌ Critical ZIP Error: {e}")
 
@@ -101,8 +103,10 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
 
     match = re.search(r'-o\s+"([^"]+)"', raw_command)
     if not match:
-        update_link_status(
-            file_path, original_magnet, "FAILED: Could not parse curl command"
+        update_yaml_field(
+            file_path,
+            original_magnet,
+            {"status": "FAILED: Could not parse curl command"},
         )
         print(
             f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
@@ -158,22 +162,23 @@ def run_curl_download(raw_command, target_dir, pbar_index, original_magnet, file
         )
         if progress_match and total_bytes > 0:
             percent = int(progress_match.group(1))
-            # Calculate current bytes based on percentage
-            current_bytes = int((percent / 100) * total_bytes)
-            pbar.n = current_bytes
+            pbar.n = int((percent / 100) * total_bytes)
             pbar.refresh()
 
     process.wait()
     if process.returncode in [0, 18]:
         extract_and_cleanup(full_path, pbar)
-        update_link_status(file_path, original_magnet, "DONE")
+        update_yaml_field(file_path, original_magnet, {"status": "DONE"})
     else:
-        update_link_status(
-            file_path, original_magnet, f"FAILED: Curl Exit Code {process.returncode}"
+        update_yaml_field(
+            file_path,
+            original_magnet,
+            {"status": f"FAILED: Curl Exit Code {process.returncode}"},
         )
         print(
             f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
         )
+
     pbar.close()
 
 
@@ -208,73 +213,95 @@ def main():
         print("No pending items to process.")
         return
 
-    print(f"⚙️ Processing {len(pending_items)} items from YAML.")
+    # Check which items need a browser (no curl_cmd saved yet)
+    items_needing_scrape = [i for i in pending_items if not i.get("curl_cmd")]
 
+    print(f"⚙️ Processing {len(pending_items)} items from YAML.")
     # Shared pool for background downloads
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_DOWNLOADS
     ) as executor:
-        with sync_playwright() as p:
-            # Single browser context for everything
-            context = p.chromium.launch_persistent_context(
-                "./webtor_session",
-                headless=False,  # xvfb handles this
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            page = context.pages[0]
-            Stealth().apply_stealth_sync(page)
+        # 1. Start downloads for items that ALREADY have a curl_cmd
+        for i, item in enumerate(pending_items):
+            if item.get("curl_cmd"):
+                print(f"⚡ Using cached command for: {item.get('title')}")
+                executor.submit(
+                    run_curl_download,
+                    item["curl_cmd"],
+                    target_folder,
+                    i,
+                    item["magnet"],
+                    source_file,
+                )
 
-            for i, item in enumerate(pending_items):
-                m = item["magnet"]
-                title = item.get("title", "Unknown")
+        # 2. Scrape items that don't have a curl_cmd
+        if items_needing_scrape:
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    "./webtor_session",
+                    headless=False,  # xvfb handles this
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                page = context.pages[0]
+                Stealth().apply_stealth_sync(page)
 
-                try:
-                    print(
-                        f"🌐 [{i + 1}/{len(pending_items)}] Fetching Webtor CMD for: {title}"
-                    )
-                    page.goto("https://webtor.io/", wait_until="domcontentloaded")
+                for i, item in enumerate(items_needing_scrape):
+                    m = item["magnet"]
+                    title = item.get("title", "Unknown")
 
-                    search_input = page.wait_for_selector(
-                        'input[placeholder*="magnet"]'
-                    )
-                    search_input.fill(m)
-                    search_input.press("Enter")
+                    try:
+                        print(f"🌐 Fetching Webtor CMD for: {title}")
+                        page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
-                    zip_btn = page.wait_for_selector(
-                        "button:has-text('ZIP')", timeout=180000
-                    )
-                    zip_btn.click()
-
-                    copy_btn = page.wait_for_selector(
-                        "text='copy curl cmd'", timeout=30000
-                    )
-                    copy_btn.click()
-
-                    time.sleep(2)  # Safe clipboard buffer
-                    captured_curl = pyperclip.paste().strip()
-
-                    if captured_curl.startswith("curl"):
-                        # Submit to background thread and move to NEXT magnet immediately
-                        executor.submit(
-                            run_curl_download,
-                            captured_curl,
-                            target_folder,
-                            i,
-                            m,
-                            source_file,
+                        search_input = page.wait_for_selector(
+                            'input[placeholder*="magnet"]'
                         )
-                    else:
-                        update_link_status(source_file, m, "FAILED: Scraping Error")
-                        print(f"❌ Failed to grab command for link {i + 1}")
+                        search_input.fill(m)
+                        search_input.press("Enter")
 
-                except Exception as e:
-                    print(f"❌ Error on {title}: {e}")
-                    update_link_status(source_file, m, "FAILED: Timeout/UI Error")
+                        zip_btn = page.wait_for_selector(
+                            "button:has-text('ZIP')", timeout=180000
+                        )
+                        zip_btn.click()
+
+                        copy_btn = page.wait_for_selector(
+                            "text='copy curl cmd'", timeout=30000
+                        )
+                        copy_btn.click()
+
+                        time.sleep(2)  # Safe clipboard buffer
+                        captured_curl = pyperclip.paste().strip()
+
+                        if captured_curl.startswith("curl"):
+                            # Save the command to YAML so we don't scrape it next time
+                            update_yaml_field(
+                                source_file, m, {"curl_cmd": captured_curl}
+                            )
+                            # Start download
+                            executor.submit(
+                                run_curl_download,
+                                captured_curl,
+                                target_folder,
+                                i,
+                                m,
+                                source_file,
+                            )
+                        else:
+                            update_yaml_field(
+                                source_file, m, {"status": "FAILED: Scraping Error"}
+                            )
+                            print(f"❌ Failed to grab command for link {i + 1}")
+
+                    except Exception as e:
+                        print(f"❌ Error on {title}: {e}")
+                        update_yaml_field(
+                            source_file, m, {"status": "FAILED: Timeout/UI Error"}
+                        )
 
             print("✔ Scraping complete. Browser closed. Downloads running...")
             context.close()
 
-    print(f"\n🏁 Finished. Source file '{source_file}' updated.")
+    print("🏁 Processing finished.")
 
 
 if __name__ == "__main__":
