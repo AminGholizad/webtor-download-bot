@@ -22,6 +22,30 @@ MAX_CONCURRENT_DOWNLOADS = 3
 file_modify_lock = threading.Lock()
 
 
+class SlotManager:
+    """Manages vertical terminal lines to prevent progress bars from overlapping."""
+
+    def __init__(self, max_slots):
+        self.slots = [False] * max_slots
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        with self.lock:
+            for i, occupied in enumerate(self.slots):
+                if not occupied:
+                    self.slots[i] = True
+                    return i
+        return 0
+
+    def release(self, i):
+        with self.lock:
+            if 0 <= i < len(self.slots):
+                self.slots[i] = False
+
+
+slot_manager = SlotManager(MAX_CONCURRENT_DOWNLOADS)
+
+
 def load_yaml(file_path):
     if not os.path.exists(file_path):
         return []
@@ -29,7 +53,7 @@ def load_yaml(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return data if isinstance(data, list) else []
-    except Exception as e:
+    except Exception:
         return []
 
 
@@ -99,10 +123,10 @@ def extract_and_cleanup(zip_path, pbar):
         tqdm.write(f"❌ Critical ZIP extraction error: {e}")
 
 
-def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file_path):
-    """
-    slot_index determines the vertical position of the progress bar.
-    """
+def run_curl_download(raw_command, target_dir, original_magnet, file_path):
+    # 1. Claim a visual slot
+    slot = slot_manager.acquire()
+
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
@@ -113,6 +137,7 @@ def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file
             original_magnet,
             {"status": "FAILED: Could not parse curl command"},
         )
+        slot_manager.release(slot)
         tqdm.write(
             f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
         )
@@ -128,7 +153,7 @@ def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file
         fixed_command = fixed_command.replace("curl", "curl -C -", 1)
 
     # Initialize TQDM bar for this specific download
-    # position=slot_index + 1 to leave room for general logs at the top
+    # position=slot + 1 to leave room for general logs at the top
     # UI SETUP:
     # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
     pbar = tqdm(
@@ -136,7 +161,7 @@ def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file
         desc=f"🚀 {clean_filename[:20]}",
         unit="B",
         unit_scale=True,
-        position=slot_index + 1,
+        position=slot + 1,
         leave=False,
         dynamic_ncols=True,
         bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
@@ -173,6 +198,7 @@ def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file
 
     process.wait()
     if process.returncode in [0, 18]:
+        tqdm.write(f"✅ Downloaded: {clean_filename}")
         extract_and_cleanup(full_path, pbar)
         update_yaml_field(file_path, original_magnet, {"status": "DONE"})
     else:
@@ -186,6 +212,8 @@ def run_curl_download(raw_command, target_dir, slot_index, original_magnet, file
         )
 
     pbar.close()
+    # 2. Free the slot for the next download in queue
+    slot_manager.release(slot)
 
 
 def main():
@@ -216,7 +244,7 @@ def main():
     ]
 
     if not pending_items:
-        tqdm.write("✅ All items are already marked DONE.")
+        print("✅ No pending items.")
         return
 
     tqdm.write(f"⚙️ Found {len(pending_items)} pending items.")
@@ -225,32 +253,28 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_CONCURRENT_DOWNLOADS
     ) as executor:
-        current_slot = 0
-
         # 1. Start cached commands
         for item in pending_items:
             if item.get("curl_cmd"):
-                tqdm.write(f"⚡ Using cached command for: {item.get('title')}")
+                tqdm.write(f"⚡ Cached: {item.get('title')[:20]}...")
                 executor.submit(
                     run_curl_download,
                     item["curl_cmd"],
                     target_folder,
-                    current_slot % MAX_CONCURRENT_DOWNLOADS,
                     item["magnet"],
                     source_file,
                 )
-                current_slot += 1
 
         # 2. Scrape missing commands
         items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
         if items_to_scrape:
             with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
+                browser = p.chromium.launch_persistent_context(
                     "./webtor_session",
                     headless=False,  # xvfb handles this
                     args=["--disable-blink-features=AutomationControlled"],
                 )
-                page = context.pages[0]
+                page = browser.pages[0]
                 Stealth().apply_stealth_sync(page)
 
                 for item in items_to_scrape:
@@ -258,7 +282,7 @@ def main():
                     title = item.get("title", "Unknown")
 
                     try:
-                        tqdm.write(f"🌐 Fetching Webtor CMD for: {title}")
+                        tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
                         page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
                         search_input = page.wait_for_selector(
@@ -290,29 +314,26 @@ def main():
                                 run_curl_download,
                                 captured_curl,
                                 target_folder,
-                                current_slot % MAX_CONCURRENT_DOWNLOADS,
                                 m,
                                 source_file,
                             )
-                            current_slot += 1
                         else:
                             update_yaml_field(
                                 source_file, m, {"status": "FAILED: Scraping Error"}
                             )
-                            tqdm.write(f"❌ Failed to grab command for link {i + 1}")
+                            tqdm.write(f"❌ Failed to grab command for link {title}")
 
                     except Exception as e:
-                        tqdm.write(f"❌ Error on {title}: {e}")
+                        tqdm.write(f"❌ Scrape error on {title}: {e}")
                         update_yaml_field(
-                            source_file, m, {"status": "FAILED: Timeout/UI Error"}
+                            source_file, m, {"status": "FAILED: Browser error"}
                         )
+                browser.close()
 
-                context.close()
-
-        tqdm.write("⏳ Scraping finished. Waiting for all downloads...")
+        tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
         executor.shutdown(wait=True)
 
-    print("🏁 Processing finished.")
+    tqdm.write("🏁 Processing finished.")
 
 
 if __name__ == "__main__":
