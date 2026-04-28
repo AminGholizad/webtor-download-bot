@@ -29,12 +29,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Sync dependencies and install browsers
 uv sync
 uv run playwright install chromium
+uv run playwright install-deps chromium
 ```
 
 ### 3. Manual Installation (Pip)
 ```bash
 pip install playwright playwright-stealth pyperclip tqdm
 playwright install chromium
+playwright install-deps chromium
 ```
 
 ---
