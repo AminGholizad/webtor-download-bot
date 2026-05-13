@@ -18,7 +18,7 @@ A high-performance Python automation tool managed by **uv** that transforms **We
 ## 🚀 Installation
 
 ### 1. Prerequisites
-Ensure you have Python 3.13+ and `curl` installed. For headless environments (Linux servers), `xvfb` is required.
+Ensure you have Python 3.13+ and `curl` installed. Please install one of  `xclip`, `xselect` (on X11) or `wl-clipboard` (on Wayland) for copy/paste mechanism to work. For headless environments (Linux servers), `xvfb` is required.
 
 ### 2. Setup with `uv` (Recommended)
 This script uses `uv` for ultra-fast dependency management.
