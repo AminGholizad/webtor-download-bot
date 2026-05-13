@@ -286,7 +286,7 @@ def main():
                         page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
                         search_input = page.wait_for_selector(
-                            'input[placeholder*="magnet"]'
+                            'input[placeholder*="magnet" i]'
                         )
                         search_input.fill(m)
                         search_input.press("Enter")
@@ -297,7 +297,7 @@ def main():
                         zip_btn.click()
 
                         copy_btn = page.wait_for_selector(
-                            "text='copy curl cmd'", timeout=100000
+                            "a:has-text('curl')", timeout=100000
                         )
                         copy_btn.click()
 
