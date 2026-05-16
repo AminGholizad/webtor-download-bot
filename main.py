@@ -1,18 +1,20 @@
-import concurrent.futures
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
 from urllib.parse import unquote
 
 import pyperclip
+import typer
 import yaml
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 from tqdm import tqdm
+from typing_extensions import Annotated
 
 # --- SETTINGS ---
 MAX_CONCURRENT_DOWNLOADS = 3
@@ -20,6 +22,8 @@ MAX_CONCURRENT_DOWNLOADS = 3
 
 # Lock to prevent file corruption during parallel status updates
 file_modify_lock = threading.Lock()
+
+app = typer.Typer()
 
 
 class SlotManager:
@@ -46,35 +50,37 @@ class SlotManager:
 slot_manager = SlotManager(MAX_CONCURRENT_DOWNLOADS)
 
 
-def load_yaml(file_path):
-    if not os.path.exists(file_path):
+def load_yaml(yaml_path: str) -> list[Any]:
+    if not os.path.exists(yaml_path):
         return []
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def save_yaml(file_path, data):
-    with open(file_path, "w", encoding="utf-8") as f:
-        # Use allow_unicode=True to preserve movie titles with special characters
+def save_yaml(yaml_path: str, data: Any) -> None:
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        # Use allow_unicode=True to preserve titles with special characters
         yaml.dump(
             data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
         )
 
 
-def update_yaml_field(file_path, magnet_link, updates: dict):
+def update_yaml_field(
+    yaml_path: str, magnet_link: str, updates: dict[str, str]
+) -> None:
     """
     Updates multiple fields (like status and curl_cmd) for a specific magnet.
     'updates' should be a dictionary like {'status': 'DONE', 'curl_cmd': '...'}
     """
-    if not file_path:
+    if not yaml_path:
         return
 
     with file_modify_lock:
-        data = load_yaml(file_path)
+        data = load_yaml(yaml_path)
         updated = False
         for entry in data:
             if entry.get("magnet") == magnet_link:
@@ -83,10 +89,10 @@ def update_yaml_field(file_path, magnet_link, updates: dict):
                 break
 
         if updated:
-            save_yaml(file_path, data)
+            save_yaml(yaml_path, data)
 
 
-def extract_and_cleanup(zip_path, pbar):
+def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
     """
     Unzips the file member-by-member to ignore CRC errors
     and deletes the original ZIP.
@@ -123,42 +129,53 @@ def extract_and_cleanup(zip_path, pbar):
         tqdm.write(f"❌ Critical ZIP extraction error: {e}")
 
 
-def run_curl_download(raw_command, target_dir, original_magnet, file_path):
+def fix_curl_cmd(
+    command: str, target_dir: str, original_magnet: str, yaml_path: Optional[str] = None
+) -> tuple[str, str]:
+    match = re.search(r'-o\s+"([^"]+)"', command)
+    if not match:
+        if yaml_path:
+            update_yaml_field(
+                yaml_path,
+                original_magnet,
+                {"status": "FAILED: Could not parse curl command"},
+            )
+        tqdm.write("\n❌ Could not parse curl command.")
+        return command, os.path.curdir
+
+    encoded_filename = match.group(1)
+    clean_filename = unquote(encoded_filename)
+    full_path = os.path.join(target_dir, clean_filename)
+
+    fixed_command = command.replace(encoded_filename, full_path, 1)
+    if "-C -" not in fixed_command:
+        fixed_command = fixed_command.replace("curl", "curl -C -", 1)
+    return fixed_command, full_path
+
+
+def run_curl_download(
+    raw_command: str,
+    target_dir: str,
+    original_magnet: str,
+    yaml_path: Optional[str] = None,
+):
     # 1. Claim a visual slot
     slot = slot_manager.acquire()
 
     target_dir = os.path.abspath(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
-    match = re.search(r'-o\s+"([^"]+)"', raw_command)
-    if not match:
-        update_yaml_field(
-            file_path,
-            original_magnet,
-            {"status": "FAILED: Could not parse curl command"},
-        )
-        slot_manager.release(slot)
-        tqdm.write(
-            f"\n❌ Curl failed with exit code {process.returncode}. Skipping extraction."
-        )
-        subprocess.run(raw_command, shell=True)
-        return
-
-    encoded_filename = match.group(1)
-    clean_filename = unquote(encoded_filename)
-    full_path = os.path.join(target_dir, clean_filename)
-
-    fixed_command = raw_command.replace(f'"{encoded_filename}"', f'"{full_path}"', 1)
-    if "-C -" not in fixed_command:
-        fixed_command = fixed_command.replace("curl", "curl -C -", 1)
-
+    fixed_command, full_path = fix_curl_cmd(
+        raw_command, target_dir, original_magnet, yaml_path
+    )
+    download_filename = os.path.basename(full_path)
     # Initialize TQDM bar for this specific download
     # position=slot + 1 to leave room for general logs at the top
     # UI SETUP:
     # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
     pbar = tqdm(
         total=100,
-        desc=f"🚀 {clean_filename[:20]}",
+        desc=f"🚀 {download_filename[:20]}",
         unit="B",
         unit_scale=True,
         position=slot + 1,
@@ -175,6 +192,20 @@ def run_curl_download(raw_command, target_dir, original_magnet, file_path):
         text=True,
         bufsize=1,
     )
+
+    if process.stdout is None:
+        if yaml_path:
+            update_yaml_field(
+                yaml_path,
+                original_magnet,
+                {"status": "FAILED: Could not open stdout pipe"},
+            )
+        tqdm.write(
+            f"❌ Failed to start download for {download_filename}: Could not open stdout pipe."
+        )
+        pbar.close()
+        slot_manager.release(slot)
+        return
 
     total_bytes = 0
     for line in iter(process.stdout.readline, ""):
@@ -198,17 +229,19 @@ def run_curl_download(raw_command, target_dir, original_magnet, file_path):
 
     process.wait()
     if process.returncode in [0, 18]:
-        tqdm.write(f"✅ Downloaded: {clean_filename}")
+        tqdm.write(f"✅ Downloaded: {download_filename}")
         extract_and_cleanup(full_path, pbar)
-        update_yaml_field(file_path, original_magnet, {"status": "DONE"})
+        if yaml_path:
+            update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
     else:
-        update_yaml_field(
-            file_path,
-            original_magnet,
-            {"status": f"FAILED: Curl Exit Code {process.returncode}"},
-        )
+        if yaml_path:
+            update_yaml_field(
+                yaml_path,
+                original_magnet,
+                {"status": f"FAILED: Curl Exit Code {process.returncode}"},
+            )
         tqdm.write(
-            f"\n⚠️ Download failed for {clean_filename} (Exit Code: {process.returncode})"
+            f"\n⚠️ Download failed for {download_filename} (Exit Code: {process.returncode})"
         )
 
     pbar.close()
@@ -216,33 +249,147 @@ def run_curl_download(raw_command, target_dir, original_magnet, file_path):
     slot_manager.release(slot)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: xvfb-run --auto-servernum uv run main.py --file movies.yaml")
-        return
-
-    target_folder = os.path.expanduser("~/Downloads")
-    source_file = None
-    all_entries = []
-
-    if sys.argv[1] in ["--file", "-f"]:
-        source_file = sys.argv[2]
-        if len(sys.argv) > 3:
-            target_folder = os.path.expanduser(sys.argv[3])
-        all_entries = load_yaml(source_file)
-    else:
-        # Fallback for single magnet string passed via CLI
-        all_entries = [{"magnet": sys.argv[1], "title": "Manual Entry"}]
-        if len(sys.argv) > 2:
-            target_folder = os.path.expanduser(sys.argv[2])
-
-    # filter items that aren't already DONE and have a magnet link
+def get_pending_items(all_entries):
+    """filter items that aren't already DONE and have a magnet link"""
     pending_items = [
         item
         for item in all_entries
         if item.get("status") != "DONE" and item.get("magnet")
     ]
+    return pending_items
 
+
+def download_cached(
+    pending_items: list[Any],
+    executor: ThreadPoolExecutor,
+    target_folder: str,
+    yaml_path: str,
+) -> None:
+    for item in pending_items:
+        if item.get("curl_cmd"):
+            tqdm.write(f"⚡ Cached: {item.get('title')[:20]}...")
+            executor.submit(
+                run_curl_download,
+                item["curl_cmd"],
+                target_folder,
+                item["magnet"],
+                yaml_path,
+            )
+
+
+def scrape_n_download(
+    pending_items: list[Any],
+    executor: ThreadPoolExecutor,
+    target_folder: str,
+    yaml_path: Optional[str] = None,
+) -> None:
+    items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
+    if items_to_scrape:
+        with sync_playwright() as p:
+            browser = p.chromium.launch_persistent_context(
+                "./webtor_session",
+                headless=False,  # xvfb handles this
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = browser.pages[0]
+            Stealth().apply_stealth_sync(page)
+
+            for item in items_to_scrape:
+                m = item["magnet"]
+                title = item.get("title", "Unknown")
+
+                try:
+                    tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
+                    page.goto("https://webtor.io/", wait_until="domcontentloaded")
+
+                    search_input = page.wait_for_selector(
+                        'input[placeholder*="magnet" i]'
+                    )
+                    if not search_input:
+                        tqdm.write(
+                            f"❌ Scrape error on {title}: Magnet input field not found."
+                        )
+                        if yaml_path:
+                            update_yaml_field(
+                                yaml_path,
+                                m,
+                                {"status": "FAILED: Magnet input not found"},
+                            )
+                        continue
+                    search_input.fill(m)
+                    search_input.press("Enter")
+
+                    zip_btn = page.wait_for_selector(
+                        "button:has-text('ZIP')", timeout=180000
+                    )
+                    if not zip_btn:
+                        tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
+                        if yaml_path:
+                            update_yaml_field(
+                                yaml_path, m, {"status": "FAILED: ZIP button not found"}
+                            )
+                        continue
+                    zip_btn.click()
+
+                    copy_btn = page.wait_for_selector(
+                        "a:has-text('curl')", timeout=100000
+                    )
+                    if not copy_btn:
+                        tqdm.write(
+                            f"❌ Scrape error on {title}: Curl copy button not found."
+                        )
+                        if yaml_path:
+                            update_yaml_field(
+                                yaml_path,
+                                m,
+                                {"status": "FAILED: Curl copy button not found"},
+                            )
+                        continue
+                    copy_btn.click()
+
+                    time.sleep(2)  # Safe clipboard buffer
+                    captured_curl = pyperclip.paste().strip()
+
+                    if captured_curl.startswith("curl"):
+                        # Save the command to YAML so we don't scrape it next time
+                        if yaml_path:
+                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
+                        # Start download
+                        executor.submit(
+                            run_curl_download,
+                            captured_curl,
+                            target_folder,
+                            m,
+                            yaml_path,
+                        )
+                    else:
+                        if yaml_path:
+                            update_yaml_field(
+                                yaml_path, m, {"status": "FAILED: Scraping Error"}
+                            )
+                        tqdm.write(f"❌ Failed to grab command for link {title}")
+
+                except Exception as e:
+                    tqdm.write(f"❌ Scrape error on {title}: {e}")
+                    if yaml_path:
+                        update_yaml_field(
+                            yaml_path, m, {"status": "FAILED: Browser error"}
+                        )
+            browser.close()
+
+    tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
+    executor.shutdown(wait=True)
+
+
+@app.command()
+def file(
+    yaml_path: str,
+    target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
+):
+    """use links inside a yaml file"""
+    target_folder = os.path.expanduser(target_folder)
+    all_entries = load_yaml(yaml_path)
+    pending_items = get_pending_items(all_entries)
     if not pending_items:
         print("✅ No pending items.")
         return
@@ -250,91 +397,73 @@ def main():
     tqdm.write(f"⚙️ Found {len(pending_items)} pending items.")
 
     # We use a Semaphore to limit active downloads and manage bar slots
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=MAX_CONCURRENT_DOWNLOADS
-    ) as executor:
-        # 1. Start cached commands
-        for item in pending_items:
-            if item.get("curl_cmd"):
-                tqdm.write(f"⚡ Cached: {item.get('title')[:20]}...")
-                executor.submit(
-                    run_curl_download,
-                    item["curl_cmd"],
-                    target_folder,
-                    item["magnet"],
-                    source_file,
-                )
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+        download_cached(pending_items, executor, target_folder, yaml_path)
+        scrape_n_download(pending_items, executor, target_folder, yaml_path)
+    tqdm.write("🏁 Processing finished.")
 
-        # 2. Scrape missing commands
-        items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
-        if items_to_scrape:
-            with sync_playwright() as p:
-                browser = p.chromium.launch_persistent_context(
-                    "./webtor_session",
-                    headless=False,  # xvfb handles this
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                page = browser.pages[0]
-                Stealth().apply_stealth_sync(page)
 
-                for item in items_to_scrape:
-                    m = item["magnet"]
-                    title = item.get("title", "Unknown")
+@app.command()
+def link(
+    magnet_link: str,
+    target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
+):
+    # if len(sys.argv) < 2:
+    #     print("Usage: xvfb-run --auto-servernum uv run main.py --file movies.yaml")
+    #     return
 
-                    try:
-                        tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
-                        page.goto("https://webtor.io/", wait_until="domcontentloaded")
+    target_folder = os.path.expanduser(target_folder)
 
-                        search_input = page.wait_for_selector(
-                            'input[placeholder*="magnet" i]'
-                        )
-                        search_input.fill(m)
-                        search_input.press("Enter")
+    with sync_playwright() as p:
+        browser = p.chromium.launch_persistent_context(
+            "./webtor_session",
+            headless=False,  # xvfb handles this
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = browser.pages[0]
+        Stealth().apply_stealth_sync(page)
 
-                        zip_btn = page.wait_for_selector(
-                            "button:has-text('ZIP')", timeout=180000
-                        )
-                        zip_btn.click()
+        title = "Manual Entry"
 
-                        copy_btn = page.wait_for_selector(
-                            "a:has-text('curl')", timeout=100000
-                        )
-                        copy_btn.click()
+        try:
+            tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
+            page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
-                        time.sleep(2)  # Safe clipboard buffer
-                        captured_curl = pyperclip.paste().strip()
+            search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
+            if not search_input:
+                tqdm.write(f"❌ Scrape error on {title}: Magnet input field not found.")
+                return
+            search_input.fill(magnet_link)
+            search_input.press("Enter")
 
-                        if captured_curl.startswith("curl"):
-                            # Save the command to YAML so we don't scrape it next time
-                            update_yaml_field(
-                                source_file, m, {"curl_cmd": captured_curl}
-                            )
-                            # Start download
-                            executor.submit(
-                                run_curl_download,
-                                captured_curl,
-                                target_folder,
-                                m,
-                                source_file,
-                            )
-                        else:
-                            update_yaml_field(
-                                source_file, m, {"status": "FAILED: Scraping Error"}
-                            )
-                            tqdm.write(f"❌ Failed to grab command for link {title}")
+            zip_btn = page.wait_for_selector("button:has-text('ZIP')", timeout=180000)
+            if not zip_btn:
+                tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
+                return
+            zip_btn.click()
 
-                    except Exception as e:
-                        tqdm.write(f"❌ Scrape error on {title}: {e}")
-                        update_yaml_field(
-                            source_file, m, {"status": "FAILED: Browser error"}
-                        )
-                browser.close()
+            copy_btn = page.wait_for_selector("a:has-text('curl')", timeout=100000)
+            if not copy_btn:
+                tqdm.write(f"❌ Scrape error on {title}: Curl copy button not found.")
+                return
+            copy_btn.click()
 
-        tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
-        executor.shutdown(wait=True)
+            time.sleep(2)  # Safe clipboard buffer
+            captured_curl = pyperclip.paste().strip()
+
+            if captured_curl.startswith("curl"):
+                run_curl_download(captured_curl, target_folder, magnet_link)
+            else:
+                tqdm.write(f"❌ Failed to grab command for link {title}")
+
+        except Exception as e:
+            tqdm.write(f"❌ Scrape error on {title}: {e}")
+        browser.close()
+
+    tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
 
     tqdm.write("🏁 Processing finished.")
 
 
 if __name__ == "__main__":
-    main()
+    app()
