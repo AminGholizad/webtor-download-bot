@@ -422,14 +422,16 @@ def link(
 ):
     target_folder = os.path.expanduser(target_folder)
     match = re.search("dn=(.+)&", magnet_link)
-    name = match.group(1).replace('+',' ') if match else "Manual Entry"
+    name = unquote(match.group(1)).replace("+"," ") if match else "Manual Entry"
+    download_link = ''
     with sync_playwright() as p:
         browser, page = get_browser_context(p)
         match scrape_webtor_curl(page, magnet_link, name):
             case Ok(captured_link):
-                run_curl_download(captured_link, target_folder, magnet_link)
+                download_link=captured_link
         browser.close()
-
+    if download_link:
+        run_curl_download(captured_link, target_folder, magnet_link)
     tqdm.write("🏁 Processing finished.")
 
 
