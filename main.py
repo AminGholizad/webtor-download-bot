@@ -421,10 +421,11 @@ def link(
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
     target_folder = os.path.expanduser(target_folder)
-
+    match = re.search("dn=(.+)&", magnet_link)
+    name = match.group(1).replace('+',' ') if match else "Manual Entry"
     with sync_playwright() as p:
         browser, page = get_browser_context(p)
-        match scrape_webtor_curl(page, magnet_link, "Manual Entry"):
+        match scrape_webtor_curl(page, magnet_link, name):
             case Ok(captured_link):
                 run_curl_download(captured_link, target_folder, magnet_link)
         browser.close()
