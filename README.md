@@ -18,7 +18,7 @@ A high-performance Python automation tool managed by **uv** that transforms **We
 ## 🚀 Installation
 
 ### 1. Prerequisites
-Ensure you have Python 3.13+ and `curl` installed. Please install one of  `xclip`, `xselect` (on X11) or `wl-clipboard` (on Wayland) for copy/paste mechanism to work. For headless environments (Linux servers), `xvfb` is required.
+Ensure you have Python 3.13+ and `curl` installed. For headless environments (Linux servers), `xvfb` is required.
 
 ### 2. Setup with `uv` (Recommended)
 This script uses `uv` for ultra-fast dependency management.
@@ -34,7 +34,7 @@ uv run playwright install-deps chromium
 
 ### 3. Manual Installation (Pip)
 ```bash
-pip install playwright playwright-stealth pyperclip tqdm
+pip install playwright playwright-stealth tqdm
 playwright install chromium
 playwright install-deps chromium
 ```
@@ -59,28 +59,28 @@ The script expects a .yaml file for batch processing. This allows the bot to tra
 ### Batch Processing (Recommended)
 The script will iterate through the YAML, skip finished items, and download pending ones.
 ```bash
-xvfb-run --auto-servernum uv run main.py --file links.yaml
+xvfb-run --auto-servernum uv run main.py file links.yaml
 ```
 
 ### Single Magnet Link
 ```bash
-xvfb-run --auto-servernum uv run main.py "magnet:?xt=urn:btih:..."
+xvfb-run --auto-servernum uv run main.py link "magnet:?xt=urn:btih:..."
 ```
 
 ### Custom Download Folder
 The default is `~/Downloads`. To change it:
 ```bash
-xvfb-run --auto-servernum uv run main.py "magnet:?xt=urn:btih:..." "/path/to/custom/folder"
-xvfb-run --auto-servernum uv run main.py --file links.yaml "/path/to/custom/folder"
+xvfb-run --auto-servernum uv run main.py link "magnet:?xt=urn:btih:..." -t "/path/to/custom/folder"
+xvfb-run --auto-servernum uv run main.py file links.yaml -t "/path/to/custom/folder"
 ```
 
 ### Convenience Script
 You can also use the provided `download.sh`:
 ```bash
-./download.sh "magnet:?xt=urn:btih:..."
-./download.sh "magnet:?xt=urn:btih:..." "/path/to/custom/folder"
-./download.sh  --file links.yaml
-./download.sh  --file links.yaml "/path/to/custom/folder"
+./download.sh link "magnet:?xt=urn:btih:..."
+./download.sh link "magnet:?xt=urn:btih:..." -t "/path/to/custom/folder"
+./download.sh file links.yaml
+./download.sh file links.yaml -t "/path/to/custom/folder"
 ```
 
 ---
@@ -112,6 +112,5 @@ Adjust these settings at the top of `main.py`:
 * **Captchas**: If blocked by Cloudflare, run once on a local machine (without `xvfb`) to solve the challenge. The session is preserved in `./webtor_session`.
 * **Persistence**: Do not manually edit the `status` or `curl_cmd` fields in the YAML while the script is running.
 * **Webtor ZIPs**: This script ignores CRC errors. This is intentional, as Webtor generates ZIP footers dynamically, which often triggers false-positive corruption flags in standard extraction tools.
-* **Clipboard**: The script uses the system clipboard. Avoid copying/pasting other text while the **Scraper** phase (the part opening the browser) is active. Once the downloads start, you can use your clipboard freely.
 
 ---
