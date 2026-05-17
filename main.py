@@ -33,22 +33,34 @@ class SlotManager:
         self.max_slots = max_slots
         self.slots = [False] * max_slots
         self.lock = threading.Lock()
+        self._local = threading.local()
 
-    def acquire(self):
-        """Acquires a slot. If no slots are available, returns 0 (fallback).
-        Note: The ThreadPoolExecutor should limit calls to max_slots.
-        """
+    def aquire(self):
+        """Acquires a slot. Returns the slot index."""
         with self.lock:
             for i, occupied in enumerate(self.slots):
                 if not occupied:
                     self.slots[i] = True
+                    self._local.slot = i
                     return i
+        # Fallback to 0 if all slots are somehow full
+        self._local.slot = 0
         return 0
 
-    def release(self, i):
-        with self.lock:
-            if 0 <= i < self.max_slots:
-                self.slots[i] = False
+    def release(self):
+        """Releases the slot."""
+        slot = getattr(self._local, "slot", None)
+        if slot is not None:
+            with self.lock:
+                if 0 <= slot < self.max_slots:
+                    self.slots[slot] = False
+            del self._local.slot
+
+    def __enter__(self):
+        return self.aquire()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
 
 slot_manager = SlotManager(MAX_CONCURRENT_DOWNLOADS)
@@ -169,96 +181,91 @@ def run_curl_download(
     original_magnet: str,
     yaml_path: Optional[str] = None,
 ):
-    # 1. Claim a visual slot
-    slot = slot_manager.acquire()
+    with slot_manager as slot:
+        target_dir = os.path.abspath(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
 
-    target_dir = os.path.abspath(target_dir)
-    os.makedirs(target_dir, exist_ok=True)
-
-    fixed_command, full_path = fix_curl_cmd(
-        raw_command, target_dir, original_magnet, yaml_path
-    )
-    download_filename = os.path.basename(full_path)
-    # Initialize TQDM bar for this specific download
-    # position=slot + 1 to leave room for general logs at the top
-    # UI SETUP:
-    # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
-    pbar = tqdm(
-        total=100,
-        desc=f"🚀 {download_filename[:20]}",
-        unit="B",
-        unit_scale=True,
-        position=slot + 1,
-        leave=False,
-        dynamic_ncols=True,
-        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
-    )
-
-    process = subprocess.Popen(
-        fixed_command,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    if process.stdout is None:
-        if yaml_path:
-            update_yaml_field(
-                yaml_path,
-                original_magnet,
-                {"status": "FAILED: Could not open stdout pipe"},
-            )
-        tqdm.write(
-            f"❌ Failed to start download for {download_filename}: Could not open stdout pipe."
+        fixed_command, full_path = fix_curl_cmd(
+            raw_command, target_dir, original_magnet, yaml_path
         )
+        download_filename = os.path.basename(full_path)
+        # Initialize TQDM bar for this specific download
+        # position=slot + 1 to leave room for general logs at the top
+        # UI SETUP:
+        # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
+        pbar = tqdm(
+            total=100,
+            desc=f"🚀 {download_filename[:20]}",
+            unit="B",
+            unit_scale=True,
+            position=slot + 1,
+            leave=False,
+            dynamic_ncols=True,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
+        )
+
+        process = subprocess.Popen(
+            fixed_command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        if process.stdout is None:
+            if yaml_path:
+                update_yaml_field(
+                    yaml_path,
+                    original_magnet,
+                    {"status": "FAILED: Could not open stdout pipe"},
+                )
+            tqdm.write(
+                f"❌ Failed to start download for {download_filename}: Could not open stdout pipe."
+            )
+            pbar.close()
+            return
+
+        total_bytes = 0
+        for line in iter(process.stdout.readline, ""):
+            if total_bytes == 0:
+                # Look for total size (e.g., 28.5M or 100k)
+                size_match = re.search(r"(\d+(?:\.\d+)?)\s*([kKMG])", line)
+                if size_match:
+                    val = float(size_match.group(1))
+                    unit = size_match.group(2).upper()
+                    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+                    total_bytes = int(val * multipliers.get(unit, 1))
+                    pbar.total = total_bytes
+
+            # Match curl progress line: % Total % Received % Xferd ...
+            # e.g., 10 28.5M 10 28.5M
+            progress_match = re.search(
+                r"(\d+)\s+([\d.]+[kKMG])\s+(\d+)\s+([\d.]+[kKMG])", line
+            )
+            if progress_match and total_bytes > 0:
+                percent = int(progress_match.group(1))
+                pbar.n = int((percent / 100) * total_bytes)
+                pbar.refresh()
+
+        process.wait()
+        if process.returncode in [0, 18]:
+            tqdm.write(f"✅ Downloaded: {download_filename}")
+            extract_and_cleanup(full_path, pbar)
+            if yaml_path:
+                update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
+        else:
+            if yaml_path:
+                update_yaml_field(
+                    yaml_path,
+                    original_magnet,
+                    {"status": f"FAILED: Curl Exit Code {process.returncode}"},
+                )
+            tqdm.write(
+                f"\n⚠️ Download failed for {download_filename} (Exit Code: {process.returncode})"
+            )
+
         pbar.close()
-        slot_manager.release(slot)
-        return
-
-    total_bytes = 0
-    for line in iter(process.stdout.readline, ""):
-        if total_bytes == 0:
-            # Look for total size (e.g., 28.5M or 100k)
-            size_match = re.search(r"(\d+(?:\.\d+)?)\s*([kKMG])", line)
-            if size_match:
-                val = float(size_match.group(1))
-                unit = size_match.group(2).upper()
-                multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
-                total_bytes = int(val * multipliers.get(unit, 1))
-                pbar.total = total_bytes
-
-        # Match curl progress line: % Total % Received % Xferd ...
-        # e.g., 10 28.5M 10 28.5M
-        progress_match = re.search(
-            r"(\d+)\s+([\d.]+[kKMG])\s+(\d+)\s+([\d.]+[kKMG])", line
-        )
-        if progress_match and total_bytes > 0:
-            percent = int(progress_match.group(1))
-            pbar.n = int((percent / 100) * total_bytes)
-            pbar.refresh()
-
-    process.wait()
-    if process.returncode in [0, 18]:
-        tqdm.write(f"✅ Downloaded: {download_filename}")
-        extract_and_cleanup(full_path, pbar)
-        if yaml_path:
-            update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
-    else:
-        if yaml_path:
-            update_yaml_field(
-                yaml_path,
-                original_magnet,
-                {"status": f"FAILED: Curl Exit Code {process.returncode}"},
-            )
-        tqdm.write(
-            f"\n⚠️ Download failed for {download_filename} (Exit Code: {process.returncode})"
-        )
-
-    pbar.close()
-    # 2. Free the slot for the next download in queue
-    slot_manager.release(slot)
 
 
 def get_pending_items(all_entries):
