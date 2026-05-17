@@ -288,6 +288,58 @@ def download_cached(
             )
 
 
+def get_browser_context(p):
+    """Creates a configured browser context with stealth and clipboard permissions."""
+    context = p.chromium.launch_persistent_context(
+        "./webtor_session",
+        headless=False,  # xvfb handles this
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    context.grant_permissions(["clipboard-read", "clipboard-write"])
+    page = context.pages[0]
+    Stealth().apply_stealth_sync(page)
+    return context, page
+
+
+def scrape_webtor_curl(page, magnet: str, title: str) -> Optional[str]:
+    """Scrapes the webtor.io site for a curl command for a given magnet link."""
+    try:
+        tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
+        page.goto("https://webtor.io/", wait_until="domcontentloaded")
+
+        search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
+        if not search_input:
+            tqdm.write(f"❌ Scrape error on {title}: Magnet input field not found.")
+            return None
+
+        search_input.fill(magnet)
+        search_input.press("Enter")
+
+        zip_btn = page.wait_for_selector("button:has-text('ZIP')", timeout=180000)
+        if not zip_btn:
+            tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
+            return None
+        zip_btn.click()
+
+        copy_btn = page.wait_for_selector("a:has-text('curl')", timeout=100000)
+        if not copy_btn:
+            tqdm.write(f"❌ Scrape error on {title}: Curl copy button not found.")
+            return None
+        copy_btn.click()
+
+        time.sleep(2)  # Safe clipboard buffer
+        captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
+
+        if captured_curl.startswith("curl"):
+            return captured_curl
+        else:
+            tqdm.write(f"❌ Failed to grab command for link {title}")
+            return None
+    except Exception as e:
+        tqdm.write(f"❌ Scrape error on {title}: {e}")
+        return None
+
+
 def scrape_n_download(
     pending_items: list[Any],
     executor: ThreadPoolExecutor,
@@ -297,98 +349,31 @@ def scrape_n_download(
     items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
     if items_to_scrape:
         with sync_playwright() as p:
-            browser = p.chromium.launch_persistent_context(
-                "./webtor_session",
-                headless=False,  # xvfb handles this
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            browser.grant_permissions(["clipboard-read", "clipboard-write"])
-            page = browser.pages[0]
-            Stealth().apply_stealth_sync(page)
+            browser, page = get_browser_context(p)
 
             for item in items_to_scrape:
                 m = item["magnet"]
                 title = item.get("title", "Unknown")
 
-                try:
-                    tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
-                    page.goto("https://webtor.io/", wait_until="domcontentloaded")
+                captured_curl = scrape_webtor_curl(page, m, title)
 
-                    search_input = page.wait_for_selector(
-                        'input[placeholder*="magnet" i]'
-                    )
-                    if not search_input:
-                        tqdm.write(
-                            f"❌ Scrape error on {title}: Magnet input field not found."
-                        )
-                        if yaml_path:
-                            update_yaml_field(
-                                yaml_path,
-                                m,
-                                {"status": "FAILED: Magnet input not found"},
-                            )
-                        continue
-                    search_input.fill(m)
-                    search_input.press("Enter")
-
-                    zip_btn = page.wait_for_selector(
-                        "button:has-text('ZIP')", timeout=180000
-                    )
-                    if not zip_btn:
-                        tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
-                        if yaml_path:
-                            update_yaml_field(
-                                yaml_path, m, {"status": "FAILED: ZIP button not found"}
-                            )
-                        continue
-                    zip_btn.click()
-
-                    copy_btn = page.wait_for_selector(
-                        "a:has-text('curl')", timeout=100000
-                    )
-                    if not copy_btn:
-                        tqdm.write(
-                            f"❌ Scrape error on {title}: Curl copy button not found."
-                        )
-                        if yaml_path:
-                            update_yaml_field(
-                                yaml_path,
-                                m,
-                                {"status": "FAILED: Curl copy button not found"},
-                            )
-                        continue
-                    copy_btn.click()
-
-                    time.sleep(2)  # Safe clipboard buffer
-                    captured_curl = page.evaluate(
-                        "navigator.clipboard.readText()"
-                    ).strip()
-
-                    if captured_curl.startswith("curl"):
-                        # Save the command to YAML so we don't scrape it next time
-                        if yaml_path:
-                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
-                        # Start download
-                        executor.submit(
-                            run_curl_download,
-                            captured_curl,
-                            target_folder,
-                            m,
-                            yaml_path,
-                        )
-                    else:
-                        if yaml_path:
-                            update_yaml_field(
-                                yaml_path, m, {"status": "FAILED: Scraping Error"}
-                            )
-                        tqdm.write(f"❌ Failed to grab command for link {title}")
-
-                except Exception as e:
-                    tqdm.write(f"❌ Scrape error on {title}: {e}")
+                if captured_curl:
+                    # Save the command to YAML so we don't scrape it next time
                     if yaml_path:
-                        update_yaml_field(
-                            yaml_path, m, {"status": "FAILED: Browser error"}
-                        )
+                        update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
+                    # Start download
+                    executor.submit(
+                        run_curl_download,
+                        captured_curl,
+                        target_folder,
+                        m,
+                        yaml_path,
+                    )
+                elif yaml_path:
+                    update_yaml_field(
+                        yaml_path, m, {"status": "FAILED: Scraping Error"}
+                    )
+
             browser.close()
 
     tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
@@ -421,60 +406,14 @@ def link(
     magnet_link: str,
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
-    # if len(sys.argv) < 2:
-    #     print("Usage: xvfb-run --auto-servernum uv run main.py --file movies.yaml")
-    #     return
-
     target_folder = os.path.expanduser(target_folder)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            "./webtor_session",
-            headless=False,  # xvfb handles this
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        browser.grant_permissions(["clipboard-read", "clipboard-write"])
-        page = browser.pages[0]
-        Stealth().apply_stealth_sync(page)
-
-        title = "Manual Entry"
-
-        try:
-            tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
-            page.goto("https://webtor.io/", wait_until="domcontentloaded")
-
-            search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
-            if not search_input:
-                tqdm.write(f"❌ Scrape error on {title}: Magnet input field not found.")
-                return
-            search_input.fill(magnet_link)
-            search_input.press("Enter")
-
-            zip_btn = page.wait_for_selector("button:has-text('ZIP')", timeout=180000)
-            if not zip_btn:
-                tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
-                return
-            zip_btn.click()
-
-            copy_btn = page.wait_for_selector("a:has-text('curl')", timeout=100000)
-            if not copy_btn:
-                tqdm.write(f"❌ Scrape error on {title}: Curl copy button not found.")
-                return
-            copy_btn.click()
-
-            time.sleep(2)  # Safe clipboard buffer
-            captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
-
-            if captured_curl.startswith("curl"):
-                run_curl_download(captured_curl, target_folder, magnet_link)
-            else:
-                tqdm.write(f"❌ Failed to grab command for link {title}")
-
-        except Exception as e:
-            tqdm.write(f"❌ Scrape error on {title}: {e}")
+        browser, page = get_browser_context(p)
+        captured_curl = scrape_webtor_curl(page, magnet_link, "Manual Entry")
+        if captured_curl:
+            run_curl_download(captured_curl, target_folder, magnet_link)
         browser.close()
-
-    tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
 
     tqdm.write("🏁 Processing finished.")
 
