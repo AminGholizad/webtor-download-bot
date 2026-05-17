@@ -10,8 +10,9 @@ from urllib.parse import unquote
 
 import typer
 import yaml
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 from playwright_stealth import Stealth
+from result import Err, Ok, Result
 from tqdm import tqdm
 from typing_extensions import Annotated
 
@@ -288,9 +289,9 @@ def download_cached(
             )
 
 
-def get_browser_context(p):
+def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
     """Creates a configured browser context with stealth and clipboard permissions."""
-    context = p.chromium.launch_persistent_context(
+    context = pl.chromium.launch_persistent_context(
         "./webtor_session",
         headless=False,  # xvfb handles this
         args=["--disable-blink-features=AutomationControlled"],
@@ -301,43 +302,51 @@ def get_browser_context(p):
     return context, page
 
 
-def scrape_webtor_curl(page, magnet: str, title: str) -> Optional[str]:
-    """Scrapes the webtor.io site for a curl command for a given magnet link."""
+def scrape_webtor_curl(page, magnet: str, title: str) -> Result[str, str]:
+    """
+    Scrapes the webtor.io site for a curl command for a given magnet link.
+    Returns a Result containing either the curl command or an error message.
+    """
     try:
         tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
         page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
         search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
         if not search_input:
-            tqdm.write(f"❌ Scrape error on {title}: Magnet input field not found.")
-            return None
+            msg = "FAILED: Magnet input not found"
+            tqdm.write(f"❌ Scrape error on {title}: {msg}")
+            return Err(msg)
 
         search_input.fill(magnet)
         search_input.press("Enter")
 
         zip_btn = page.wait_for_selector("button:has-text('ZIP')", timeout=180000)
         if not zip_btn:
-            tqdm.write(f"❌ Scrape error on {title}: ZIP button not found.")
-            return None
+            msg = "FAILED: ZIP button not found"
+            tqdm.write(f"❌ Scrape error on {title}: {msg}")
+            return Err(msg)
         zip_btn.click()
 
         copy_btn = page.wait_for_selector("a:has-text('curl')", timeout=100000)
         if not copy_btn:
-            tqdm.write(f"❌ Scrape error on {title}: Curl copy button not found.")
-            return None
+            msg = "FAILED: Curl copy button not found"
+            tqdm.write(f"❌ Scrape error on {title}: {msg}")
+            return Err(msg)
         copy_btn.click()
 
         time.sleep(2)  # Safe clipboard buffer
         captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
 
         if captured_curl.startswith("curl"):
-            return captured_curl
+            return Ok(captured_curl)
         else:
+            msg = "FAILED: Scraping Error"
             tqdm.write(f"❌ Failed to grab command for link {title}")
-            return None
+            return Err(msg)
     except Exception as e:
+        msg = f"FAILED: Browser error ({type(e).__name__})"
         tqdm.write(f"❌ Scrape error on {title}: {e}")
-        return None
+        return Err(msg)
 
 
 def scrape_n_download(
@@ -348,31 +357,29 @@ def scrape_n_download(
 ) -> None:
     items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
     if items_to_scrape:
-        with sync_playwright() as p:
-            browser, page = get_browser_context(p)
+        with sync_playwright() as pl:
+            browser, page = get_browser_context(pl)
 
             for item in items_to_scrape:
                 m = item["magnet"]
                 title = item.get("title", "Unknown")
 
-                captured_curl = scrape_webtor_curl(page, m, title)
-
-                if captured_curl:
-                    # Save the command to YAML so we don't scrape it next time
-                    if yaml_path:
-                        update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
-                    # Start download
-                    executor.submit(
-                        run_curl_download,
-                        captured_curl,
-                        target_folder,
-                        m,
-                        yaml_path,
-                    )
-                elif yaml_path:
-                    update_yaml_field(
-                        yaml_path, m, {"status": "FAILED: Scraping Error"}
-                    )
+                match scrape_webtor_curl(page, m, title):
+                    case Ok(captured_curl):
+                        # Save the command to YAML so we don't scrape it next time
+                        if yaml_path:
+                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
+                        # Start download
+                        executor.submit(
+                            run_curl_download,
+                            captured_curl,
+                            target_folder,
+                            m,
+                            yaml_path,
+                        )
+                    case Err(e):
+                        if yaml_path:
+                            update_yaml_field(yaml_path, m, {"status": e})
 
             browser.close()
 
@@ -410,9 +417,9 @@ def link(
 
     with sync_playwright() as p:
         browser, page = get_browser_context(p)
-        captured_curl = scrape_webtor_curl(page, magnet_link, "Manual Entry")
-        if captured_curl:
-            run_curl_download(captured_curl, target_folder, magnet_link)
+        match scrape_webtor_curl(page, magnet_link, "Manual Entry"):
+            case Ok(captured_link):
+                run_curl_download(captured_link, target_folder, magnet_link)
         browser.close()
 
     tqdm.write("🏁 Processing finished.")
