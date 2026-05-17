@@ -268,7 +268,7 @@ def run_curl_download(
         pbar.close()
 
 
-def get_pending_items(all_entries):
+def get_pending_items(all_entries)->list[str]:
     """filter items that aren't already DONE and have a magnet link"""
     pending_items = [
         item
