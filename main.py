@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import unquote
 
-import pyperclip
 import typer
 import yaml
 from playwright.sync_api import sync_playwright
@@ -30,10 +29,14 @@ class SlotManager:
     """Manages vertical terminal lines to prevent progress bars from overlapping."""
 
     def __init__(self, max_slots):
+        self.max_slots = max_slots
         self.slots = [False] * max_slots
         self.lock = threading.Lock()
 
     def acquire(self):
+        """Acquires a slot. If no slots are available, returns 0 (fallback).
+        Note: The ThreadPoolExecutor should limit calls to max_slots.
+        """
         with self.lock:
             for i, occupied in enumerate(self.slots):
                 if not occupied:
@@ -43,7 +46,7 @@ class SlotManager:
 
     def release(self, i):
         with self.lock:
-            if 0 <= i < len(self.slots):
+            if 0 <= i < self.max_slots:
                 self.slots[i] = False
 
 
@@ -132,6 +135,10 @@ def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
 def fix_curl_cmd(
     command: str, target_dir: str, original_magnet: str, yaml_path: Optional[str] = None
 ) -> tuple[str, str]:
+    # Remove silence flags to ensure progress output is captured
+    command = re.sub(r"\s-sS?\s", " ", command)
+    command = re.sub(r"^curl\s-sS?\s", "curl ", command)
+
     match = re.search(r'-o\s+"([^"]+)"', command)
     if not match:
         if yaml_path:
@@ -145,9 +152,11 @@ def fix_curl_cmd(
 
     encoded_filename = match.group(1)
     clean_filename = unquote(encoded_filename)
-    full_path = os.path.join(target_dir, clean_filename)
+    full_path = os.path.abspath(os.path.join(target_dir, clean_filename))
 
-    fixed_command = command.replace(encoded_filename, full_path, 1)
+    # Use the full match for safer replacement
+    fixed_command = command.replace(match.group(0), f'-o "{full_path}"', 1)
+
     if "-C -" not in fixed_command:
         fixed_command = fixed_command.replace("curl", "curl -C -", 1)
     return fixed_command, full_path
@@ -210,17 +219,19 @@ def run_curl_download(
     total_bytes = 0
     for line in iter(process.stdout.readline, ""):
         if total_bytes == 0:
-            size_match = re.search(r"(\d+(?:\.\d+)?[kMG])", line)
+            # Look for total size (e.g., 28.5M or 100k)
+            size_match = re.search(r"(\d+(?:\.\d+)?)\s*([kKMG])", line)
             if size_match:
-                raw_size = size_match.group(1)
-                multipliers = {"k": 1024, "M": 1024**2, "G": 1024**3}
-                val = float(re.sub(r"[kMG]", "", raw_size))
-                unit = raw_size[-1]
+                val = float(size_match.group(1))
+                unit = size_match.group(2).upper()
+                multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
                 total_bytes = int(val * multipliers.get(unit, 1))
                 pbar.total = total_bytes
 
+        # Match curl progress line: % Total % Received % Xferd ...
+        # e.g., 10 28.5M 10 28.5M
         progress_match = re.search(
-            r"(\d+)\s+([\d.]+[kMG])\s+(\d+)\s+([\d.]+[kMG])", line
+            r"(\d+)\s+([\d.]+[kKMG])\s+(\d+)\s+([\d.]+[kKMG])", line
         )
         if progress_match and total_bytes > 0:
             percent = int(progress_match.group(1))
@@ -291,6 +302,7 @@ def scrape_n_download(
                 headless=False,  # xvfb handles this
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            browser.grant_permissions(["clipboard-read", "clipboard-write"])
             page = browser.pages[0]
             Stealth().apply_stealth_sync(page)
 
@@ -348,7 +360,9 @@ def scrape_n_download(
                     copy_btn.click()
 
                     time.sleep(2)  # Safe clipboard buffer
-                    captured_curl = pyperclip.paste().strip()
+                    captured_curl = page.evaluate(
+                        "navigator.clipboard.readText()"
+                    ).strip()
 
                     if captured_curl.startswith("curl"):
                         # Save the command to YAML so we don't scrape it next time
@@ -378,7 +392,6 @@ def scrape_n_download(
             browser.close()
 
     tqdm.write("⏳ Scraping finished. Waiting for downloads to complete...")
-    executor.shutdown(wait=True)
 
 
 @app.command()
@@ -420,6 +433,7 @@ def link(
             headless=False,  # xvfb handles this
             args=["--disable-blink-features=AutomationControlled"],
         )
+        browser.grant_permissions(["clipboard-read", "clipboard-write"])
         page = browser.pages[0]
         Stealth().apply_stealth_sync(page)
 
@@ -449,7 +463,7 @@ def link(
             copy_btn.click()
 
             time.sleep(2)  # Safe clipboard buffer
-            captured_curl = pyperclip.paste().strip()
+            captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
 
             if captured_curl.startswith("curl"):
                 run_curl_download(captured_curl, target_folder, magnet_link)
