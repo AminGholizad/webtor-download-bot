@@ -145,38 +145,19 @@ def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
         tqdm.write(f"❌ Critical ZIP extraction error: {e}")
 
 
-def fix_curl_cmd(
-    command: str, target_dir: str, original_magnet: str, yaml_path: Optional[str] = None
-) -> tuple[str, str]:
-    # Remove silence flags to ensure progress output is captured
-    command = re.sub(r"\s-sS?\s", " ", command)
-    command = re.sub(r"^curl\s-sS?\s", "curl ", command)
-
-    match = re.search(r'-o\s+"([^"]+)"', command)
-    if not match:
-        if yaml_path:
-            update_yaml_field(
-                yaml_path,
-                original_magnet,
-                {"status": "FAILED: Could not parse curl command"},
-            )
-        tqdm.write("\n❌ Could not parse curl command.")
-        return command, os.path.curdir
-
-    encoded_filename = match.group(1)
-    clean_filename = unquote(encoded_filename)
-    full_path = os.path.abspath(os.path.join(target_dir, clean_filename))
-
-    # Use the full match for safer replacement
-    fixed_command = command.replace(match.group(0), f'-o "{full_path}"', 1)
-
-    if "-C -" not in fixed_command:
-        fixed_command = fixed_command.replace("curl", "curl -C -", 1)
-    return fixed_command, full_path
+def get_filename_from_url(url: str) -> str:
+    """Extracts a clean filename from the Webtor download URL."""
+    try:
+        # Handles URL formats like https://.../filename.zip?token=...
+        path_part = url.split("?")[0]
+        filename = os.path.basename(path_part)
+        return unquote(filename)
+    except Exception:
+        return "download.zip"
 
 
-def run_curl_download(
-    raw_command: str,
+def run_aria2_download(
+    download_url: str,
     target_dir: str,
     original_magnet: str,
     yaml_path: Optional[str] = None,
@@ -185,10 +166,8 @@ def run_curl_download(
         target_dir = os.path.abspath(target_dir)
         os.makedirs(target_dir, exist_ok=True)
 
-        fixed_command, full_path = fix_curl_cmd(
-            raw_command, target_dir, original_magnet, yaml_path
-        )
-        download_filename = os.path.basename(full_path)
+        download_filename = get_filename_from_url(download_url)
+        full_path = os.path.join(target_dir, download_filename)
         # Initialize TQDM bar for this specific download
         # position=slot + 1 to leave room for general logs at the top
         # UI SETUP:
@@ -204,9 +183,19 @@ def run_curl_download(
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
         )
 
+        # Build aria2c command with standard stream reporting
+        # --summary-interval=1 forces output updates every second
+        aria_command = [
+            "aria2c",
+            "--continue=True",
+            f"--dir={target_dir}",
+            f"--out={download_filename}",
+            "--summary-interval=1",
+            download_url,
+        ]
+
         process = subprocess.Popen(
-            fixed_command,
-            shell=True,
+            aria_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -228,9 +217,9 @@ def run_curl_download(
 
         total_bytes = 0
         for line in iter(process.stdout.readline, ""):
+            # Parse total size from aria2 output line: e.g., "Size: 28.5MiB" or "[(#123456 28.5MiB/100MiB(28%)]"
             if total_bytes == 0:
-                # Look for total size (e.g., 28.5M or 100k)
-                size_match = re.search(r"(\d+(?:\.\d+)?)\s*([kKMG])", line)
+                size_match = re.search(r"Size:\s*(\d+(?:\.\d+)?)\s*([kKMG])i?B", line)
                 if size_match:
                     val = float(size_match.group(1))
                     unit = size_match.group(2).upper()
@@ -238,10 +227,9 @@ def run_curl_download(
                     total_bytes = int(val * multipliers.get(unit, 1))
                     pbar.total = total_bytes
 
-            # Match curl progress line: % Total % Received % Xferd ...
-            # e.g., 10 28.5M 10 28.5M
-            progress_match = re.search(
-                r"(\d+)\s+([\d.]+[kKMG])\s+(\d+)\s+([\d.]+[kKMG])", line
+            # Match aria2 standard progress lines: e.g., " (28%)" or "30% "
+            progress_match = re.search(r"\((\d+)%\)", line) or re.search(
+                r"(\d+)%\s", line
             )
             if progress_match and total_bytes > 0:
                 percent = int(progress_match.group(1))
@@ -249,7 +237,7 @@ def run_curl_download(
                 pbar.refresh()
 
         process.wait()
-        if process.returncode in [0, 18]:
+        if process.returncode == 0:
             tqdm.write(f"✅ Downloaded: {download_filename}")
             extract_and_cleanup(full_path, pbar)
             if yaml_path:
@@ -259,7 +247,7 @@ def run_curl_download(
                 update_yaml_field(
                     yaml_path,
                     original_magnet,
-                    {"status": f"FAILED: Curl Exit Code {process.returncode}"},
+                    {"status": f"FAILED: aria2 Exit Code {process.returncode}"},
                 )
             tqdm.write(
                 f"\n⚠️ Download failed for {download_filename} (Exit Code: {process.returncode})"
@@ -268,7 +256,7 @@ def run_curl_download(
         pbar.close()
 
 
-def get_pending_items(all_entries)->list[str]:
+def get_pending_items(all_entries) -> list[str]:
     """filter items that aren't already DONE and have a magnet link"""
     pending_items = [
         item
@@ -288,7 +276,7 @@ def download_cached(
         if item.get("curl_cmd"):
             tqdm.write(f"⚡ Cached: {item.get('title')[:20]}...")
             executor.submit(
-                run_curl_download,
+                run_aria2_download,
                 item["curl_cmd"],
                 target_folder,
                 item["magnet"],
@@ -309,13 +297,13 @@ def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
     return context, page
 
 
-def scrape_webtor_curl(page, magnet: str, title: str) -> Result[str, str]:
+def scrape_webtor_url(page, magnet: str, title: str) -> Result[str, str]:
     """
-    Scrapes the webtor.io site for a curl command for a given magnet link.
-    Returns a Result containing either the curl command or an error message.
+    Scrapes the webtor.io site for a direct URL link for a given magnet link.
+    Returns a Result containing either the URL string or an error message.
     """
     try:
-        tqdm.write(f"🌐 Fetching Webtor CMD for: {title[:20]}...")
+        tqdm.write(f"🌐 Fetching Webtor URL for: {title[:20]}...")
         page.goto("https://webtor.io/", wait_until="domcontentloaded")
 
         search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
@@ -334,21 +322,21 @@ def scrape_webtor_curl(page, magnet: str, title: str) -> Result[str, str]:
             return Err(msg)
         zip_btn.click()
 
-        copy_btn = page.wait_for_selector("a:has-text('curl')", timeout=100000)
-        if not copy_btn:
-            msg = "FAILED: Curl copy button not found"
+        url_btn = page.wait_for_selector("a:has-text('url')", timeout=100000)
+        if not url_btn:
+            msg = "FAILED: URL copy button not found"
             tqdm.write(f"❌ Scrape error on {title}: {msg}")
             return Err(msg)
-        copy_btn.click()
+        url_btn.click()
 
         time.sleep(2)  # Safe clipboard buffer
-        captured_curl = page.evaluate("navigator.clipboard.readText()").strip()
+        captured_url = page.evaluate("navigator.clipboard.readText()").strip()
 
-        if captured_curl.startswith("curl"):
-            return Ok(captured_curl)
+        if captured_url.startswith("http"):
+            return Ok(captured_url)
         else:
-            msg = "FAILED: Scraping Error"
-            tqdm.write(f"❌ Failed to grab command for link {title}")
+            msg = "FAILED: Scraping Error (No valid URL captured)"
+            tqdm.write(f"❌ Failed to grab URL link for {title}")
             return Err(msg)
     except Exception as e:
         msg = f"FAILED: Browser error ({type(e).__name__})"
@@ -371,15 +359,15 @@ def scrape_n_download(
                 m = item["magnet"]
                 title = item.get("title", "Unknown")
 
-                match scrape_webtor_curl(page, m, title):
-                    case Ok(captured_curl):
-                        # Save the command to YAML so we don't scrape it next time
+                match scrape_webtor_url(page, m, title):
+                    case Ok(captured_url):
+                        # Save it under curl_cmd key to minimize rewriting the YAML architecture
                         if yaml_path:
-                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_curl})
-                        # Start download
+                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_url})
+                        # Start aria2 download
                         executor.submit(
-                            run_curl_download,
-                            captured_curl,
+                            run_aria2_download,
+                            captured_url,
                             target_folder,
                             m,
                             yaml_path,
@@ -422,16 +410,16 @@ def link(
 ):
     target_folder = os.path.expanduser(target_folder)
     match = re.search("dn=(.+)&", magnet_link)
-    name = unquote(match.group(1)).replace("+"," ") if match else "Manual Entry"
-    download_link = ''
+    name = unquote(match.group(1)).replace("+", " ") if match else "Manual Entry"
+    download_link = ""
     with sync_playwright() as p:
         browser, page = get_browser_context(p)
-        match scrape_webtor_curl(page, magnet_link, name):
+        match scrape_webtor_url(page, magnet_link, name):
             case Ok(captured_link):
-                download_link=captured_link
+                download_link = captured_link
         browser.close()
     if download_link:
-        run_curl_download(captured_link, target_folder, magnet_link)
+        run_aria2_download(download_link, target_folder, magnet_link)
     tqdm.write("🏁 Processing finished.")
 
 
