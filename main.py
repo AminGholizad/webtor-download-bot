@@ -273,11 +273,11 @@ def download_cached(
     yaml_path: str,
 ) -> None:
     for item in pending_items:
-        if item.get("curl_cmd"):
+        if item.get("download_url"):
             tqdm.write(f"⚡ Cached: {item.get('title')[:20]}...")
             executor.submit(
                 run_aria2_download,
-                item["curl_cmd"],
+                item["download_url"],
                 target_folder,
                 item["magnet"],
                 yaml_path,
@@ -349,7 +349,7 @@ def scrape_n_download(
     target_folder: str,
     yaml_path: Optional[str] = None,
 ) -> None:
-    items_to_scrape = [i for i in pending_items if not i.get("curl_cmd")]
+    items_to_scrape = [i for i in pending_items if not i.get("download_url")]
     if items_to_scrape:
         with sync_playwright() as pl:
             browser, page = get_browser_context(pl)
@@ -362,7 +362,9 @@ def scrape_n_download(
                     case Ok(captured_url):
                         # Save it under curl_cmd key to minimize rewriting the YAML architecture
                         if yaml_path:
-                            update_yaml_field(yaml_path, m, {"curl_cmd": captured_url})
+                            update_yaml_field(
+                                yaml_path, m, {"download_url": captured_url}
+                            )
                         # Start aria2 download
                         executor.submit(
                             run_aria2_download,
