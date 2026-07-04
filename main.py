@@ -322,7 +322,7 @@ def scrape_webtor_url(page, magnet: str, title: str) -> Result[str, str]:
             return Err(msg)
         zip_btn.click()
 
-        url_btn = page.wait_for_selector("a:has-text('url')", timeout=100000)
+        url_btn = page.wait_for_selector("a:text-is('URL')", timeout=100000)
         if not url_btn:
             msg = "FAILED: URL copy button not found"
             tqdm.write(f"❌ Scrape error on {title}: {msg}")
@@ -331,7 +331,6 @@ def scrape_webtor_url(page, magnet: str, title: str) -> Result[str, str]:
 
         time.sleep(2)  # Safe clipboard buffer
         captured_url = page.evaluate("navigator.clipboard.readText()").strip()
-
         if captured_url.startswith("http"):
             return Ok(captured_url)
         else:
