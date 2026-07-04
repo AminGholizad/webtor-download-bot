@@ -187,7 +187,7 @@ def run_aria2_download(
         # --summary-interval=1 forces output updates every second
         aria_command = [
             "aria2c",
-            "--continue=True",
+            "--continue=true",
             f"--dir={target_dir}",
             f"--out={download_filename}",
             "--summary-interval=1",
