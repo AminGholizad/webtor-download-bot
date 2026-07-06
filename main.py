@@ -217,24 +217,36 @@ def run_aria2_download(
 
         total_bytes = 0
         for line in iter(process.stdout.readline, ""):
-            # Parse total size from aria2 output line: e.g., "Size: 28.5MiB" or "[(#123456 28.5MiB/100MiB(28%)]"
-            if total_bytes == 0:
-                size_match = re.search(r"Size:\s*(\d+(?:\.\d+)?)\s*([kKMG])i?B", line)
-                if size_match:
-                    val = float(size_match.group(1))
-                    unit = size_match.group(2).upper()
-                    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
-                    total_bytes = int(val * multipliers.get(unit, 1))
+            # 1. Parse Total Size and Current Downloaded Bytes dynamically from lines like:
+            # [#a3a10a 460MiB/1.8GiB(24%) CN:1 DL:0B]
+            size_match = re.search(r"([\d.]+)([kKMG])i?B/([\d.]+)([kKMG])i?B", line)
+
+            if size_match:
+                multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+
+                # Parse current bytes
+                curr_val = float(size_match.group(1))
+                curr_unit = size_match.group(2).upper()
+                current_bytes = int(curr_val * multipliers.get(curr_unit, 1))
+
+                # Parse total bytes (only need to calculate this once)
+                if total_bytes == 0:
+                    total_val = float(size_match.group(3))
+                    total_unit = size_match.group(4).upper()
+                    total_bytes = int(total_val * multipliers.get(total_unit, 1))
                     pbar.total = total_bytes
 
-            # Match aria2 standard progress lines: e.g., " (28%)" or "30% "
-            progress_match = re.search(r"\((\d+)%\)", line) or re.search(
-                r"(\d+)%\s", line
-            )
-            if progress_match and total_bytes > 0:
-                percent = int(progress_match.group(1))
-                pbar.n = int((percent / 100) * total_bytes)
+                # Update progress bar positions accurately based on exact downloaded bytes
+                pbar.n = current_bytes
                 pbar.refresh()
+
+            # 2. Fallback parser: If the bytes pattern wasn't matched but a percentage is shown
+            elif total_bytes > 0:
+                progress_match = re.search(r"\((\d+)%\)", line)
+                if progress_match:
+                    percent = int(progress_match.group(1))
+                    pbar.n = int((percent / 100) * total_bytes)
+                    pbar.refresh()
 
         process.wait()
         if process.returncode == 0:
