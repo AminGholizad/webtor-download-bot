@@ -1,331 +1,24 @@
 import os
 import re
-import subprocess
-import threading
-import time
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import unquote
 
 import typer
-import yaml
-from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
-from playwright_stealth import Stealth
-from result import Err, Ok, Result
+from playwright.sync_api import sync_playwright
+from result import Err, Ok
 from tqdm import tqdm
 from typing_extensions import Annotated
 
-# --- SETTINGS ---
-MAX_CONCURRENT_DOWNLOADS = 3
-# ----------------
-
-# Lock to prevent file corruption during parallel status updates
-file_modify_lock = threading.Lock()
-# Shared reference to the executor so we can re-queue refreshed items
-global_executor: Optional[ThreadPoolExecutor] = None
-global_target_folder: str = "~/Downloads"
+import config
+from downloader import run_aria2_download
+from scraper import get_browser_context, scrape_webtor_url
+from utils import load_yaml, update_yaml_field
 
 app = typer.Typer()
 
 
-class SlotManager:
-    """Manages vertical terminal lines to prevent progress bars from overlapping."""
-
-    def __init__(self, max_slots):
-        self.max_slots = max_slots
-        self.slots = [False] * max_slots
-        self.lock = threading.Lock()
-        self._local = threading.local()
-
-    def aquire(self):
-        """Acquires a slot. Returns the slot index."""
-        with self.lock:
-            for i, occupied in enumerate(self.slots):
-                if not occupied:
-                    self.slots[i] = True
-                    self._local.slot = i
-                    return i
-        # Fallback to 0 if all slots are somehow full
-        self._local.slot = 0
-        return 0
-
-    def release(self):
-        """Releases the slot."""
-        slot = getattr(self._local, "slot", None)
-        if slot is not None:
-            with self.lock:
-                if 0 <= slot < self.max_slots:
-                    self.slots[slot] = False
-            del self._local.slot
-
-    def __enter__(self):
-        return self.aquire()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-
-
-slot_manager = SlotManager(MAX_CONCURRENT_DOWNLOADS)
-
-
-def load_yaml(yaml_path: str) -> list[Any]:
-    if not os.path.exists(yaml_path):
-        return []
-    try:
-        with open(yaml_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def save_yaml(yaml_path: str, data: Any) -> None:
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        # Use allow_unicode=True to preserve titles with special characters
-        yaml.dump(
-            data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
-        )
-
-
-def update_yaml_field(
-    yaml_path: str, magnet_link: str, updates: dict[str, str]
-) -> None:
-    """
-    Updates multiple fields (like status and download_url) for a specific magnet.
-    'updates' should be a dictionary like {'status': 'DONE', 'download_url': '...'}
-    """
-    if not yaml_path:
-        return
-
-    with file_modify_lock:
-        data = load_yaml(yaml_path)
-        updated = False
-        for entry in data:
-            if entry.get("magnet") == magnet_link:
-                entry.update(updates)
-                updated = True
-                break
-
-        if updated:
-            save_yaml(yaml_path, data)
-
-
-def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
-    """
-    Unzips the file member-by-member to ignore CRC errors
-    and deletes the original ZIP.
-    """
-    if not os.path.exists(zip_path):
-        tqdm.write(f"❌ Extraction failed: {zip_path} not found.")
-        return
-
-    # Create a folder name based on the zip name (without .zip)
-    extract_to = zip_path.rsplit(".", 1)[0]
-    pbar.set_description(f"📦 Unzipping: {os.path.basename(extract_to)[:15]}")
-
-    if not os.path.exists(extract_to):
-        os.makedirs(extract_to)
-
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for member in zf.infolist():
-                try:
-                    zf.extract(member, extract_to)
-                except (zipfile.BadZipFile, RuntimeError) as e:
-                    # This catches CRC errors or decryption errors per-file
-                    tqdm.write(
-                        f"\n⚠️ Skipping corrupt file inside ZIP ({member.filename}): {e}"
-                    )
-                    continue
-
-        # We delete the ZIP even if some internal files were corrupt,
-        # as requested ("ignore CRC check error after extraction completed").
-        os.remove(zip_path)
-        tqdm.write(f"🗑️ Deleted original ZIP: {zip_path}")
-        pbar.set_description(f"✅ Finished: {os.path.basename(extract_to)[:20]}")
-    except Exception as e:
-        tqdm.write(f"❌ Critical ZIP extraction error: {e}")
-
-
-def get_filename_from_url(url: str) -> str:
-    """Extracts a clean filename from the Webtor download URL."""
-    try:
-        clean_url = url.split("?")[0].split("#")[0]
-        filename = clean_url.rstrip("/").split("/")[-1]
-        decoded_filename = unquote(filename)
-        return decoded_filename if decoded_filename else "download.zip"
-    except Exception:
-        return "download.zip"
-
-
-def handle_expired_link(original_magnet: str, yaml_path: Optional[str] = None):
-    """Regrabs a fresh URL for a magnet that expired or timed out and queues it."""
-    global global_executor, global_target_folder
-    tqdm.write(f"🔄 Link expired or timed out. Refreshing token for magnet...")
-
-    with sync_playwright() as pl:
-        browser, page = get_browser_context(pl)
-        # Fallback tracking info
-        match = re.search("dn=(.+)&", original_magnet)
-        title = unquote(match.group(1)).replace("+", " ") if match else "Expired Item"
-
-        match scrape_webtor_url(page, original_magnet, title):
-            case Ok(fresh_url):
-                tqdm.write(f"✨ Fresh URL retrieved successfully for: {title[:20]}")
-                if yaml_path:
-                    update_yaml_field(
-                        yaml_path,
-                        original_magnet,
-                        {"curl_cmd": fresh_url, "status": "RETRIED"},
-                    )
-
-                # Re-submit the freshly pulled URL to the ongoing thread executor pool
-                if global_executor:
-                    global_executor.submit(
-                        run_aria2_download,
-                        fresh_url,
-                        global_target_folder,
-                        original_magnet,
-                        yaml_path,
-                    )
-            case Err(e):
-                tqdm.write(f"❌ Could not auto-refresh link: {e}")
-                if yaml_path:
-                    update_yaml_field(
-                        yaml_path,
-                        original_magnet,
-                        {"status": f"FAILED: Refresh failed ({e})"},
-                    )
-        browser.close()
-
-
-def run_aria2_download(
-    download_url: str,
-    target_dir: str,
-    original_magnet: str,
-    yaml_path: Optional[str] = None,
-):
-    with slot_manager as slot:
-        target_dir = os.path.abspath(target_dir)
-        os.makedirs(target_dir, exist_ok=True)
-
-        download_filename = get_filename_from_url(download_url)
-        full_path = os.path.join(target_dir, download_filename)
-        # Initialize TQDM bar for this specific download
-        # position=slot + 1 to leave room for general logs at the top
-        # UI SETUP:
-        # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
-        pbar = tqdm(
-            total=100,
-            desc=f"🚀 {download_filename[:20]}",
-            unit="B",
-            unit_scale=True,
-            position=slot + 1,
-            leave=False,
-            dynamic_ncols=True,
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
-        )
-
-        # Build aria2c command with standard stream reporting
-        # --summary-interval=1 forces output updates every second
-        aria_command = [
-            "aria2c",
-            "--continue=true",
-            f"--dir={target_dir}",
-            f"--out={download_filename}",
-            "--summary-interval=1",
-            download_url,
-        ]
-
-        process = subprocess.Popen(
-            aria_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        if process.stdout is None:
-            if yaml_path:
-                update_yaml_field(
-                    yaml_path,
-                    original_magnet,
-                    {"status": "FAILED: Could not open stdout pipe"},
-                )
-            tqdm.write(
-                f"❌ Failed to start download for {download_filename}: Could not open stdout pipe."
-            )
-            pbar.close()
-            return
-
-        total_bytes = 0
-        for line in iter(process.stdout.readline, ""):
-            # 1. Parse Total Size and Current Downloaded Bytes dynamically from lines like:
-            # [#a3a10a 460MiB/1.8GiB(24%) CN:1 DL:0B]
-            size_match = re.search(r"([\d.]+)([kKMG])i?B/([\d.]+)([kKMG])i?B", line)
-
-            if size_match:
-                multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
-
-                # Parse current bytes
-                curr_val = float(size_match.group(1))
-                curr_unit = size_match.group(2).upper()
-                current_bytes = int(curr_val * multipliers.get(curr_unit, 1))
-
-                # Parse total bytes (only need to calculate this once)
-                if total_bytes == 0:
-                    total_val = float(size_match.group(3))
-                    total_unit = size_match.group(4).upper()
-                    total_bytes = int(total_val * multipliers.get(total_unit, 1))
-                    pbar.total = total_bytes
-
-                # Update progress bar positions accurately based on exact downloaded bytes
-                pbar.n = current_bytes
-                pbar.refresh()
-
-            # 2. Fallback parser: If the bytes pattern wasn't matched but a percentage is shown
-            elif total_bytes > 0:
-                progress_match = re.search(r"\((\d+)%\)", line)
-                if progress_match:
-                    percent = int(progress_match.group(1))
-                    pbar.n = int((percent / 100) * total_bytes)
-                    pbar.refresh()
-
-        process.wait()
-        pbar.close()
-
-        if process.returncode == 0:
-            tqdm.write(f"✅ Downloaded: {download_filename}")
-            extract_and_cleanup(full_path, pbar)
-            if yaml_path:
-                update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
-
-        # Status code 19 = HTTP Status 4xx/5xx error (e.g. 401 Unauthorized / 403 Forbidden on expired tokens)
-        # Status code 24 = Authorization failed / Link timed out completely
-        elif process.returncode in [19, 24]:
-            tqdm.write(
-                f"⚠️ Link validation failed (Code {process.returncode}) for {download_filename}."
-            )
-            # Spawn a non-blocking background thread to grab a fresh link and append back into queue
-            threading.Thread(
-                target=handle_expired_link,
-                args=(original_magnet, yaml_path),
-                daemon=True,
-            ).start()
-        else:
-            if yaml_path:
-                update_yaml_field(
-                    yaml_path,
-                    original_magnet,
-                    {"status": f"FAILED: aria2 Exit Code {process.returncode}"},
-                )
-            tqdm.write(
-                f"\n❌ Download dropped permanently for {download_filename} (Code: {process.returncode})"
-            )
-
-
-def get_pending_items(all_entries) -> list[str]:
+def get_pending_items(all_entries) -> list[Any]:
     """filter items that aren't already DONE and have a magnet link"""
     pending_items = [
         item
@@ -351,65 +44,6 @@ def download_cached(
                 item["magnet"],
                 yaml_path,
             )
-
-
-def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
-    """Creates a configured browser context with stealth and clipboard permissions."""
-    context = pl.chromium.launch_persistent_context(
-        "./webtor_session",
-        headless=False,  # xvfb handles this
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    context.grant_permissions(["clipboard-read", "clipboard-write"])
-    page = context.pages[0]
-    Stealth().apply_stealth_sync(page)
-    return context, page
-
-
-def scrape_webtor_url(page, magnet: str, title: str) -> Result[str, str]:
-    """
-    Scrapes the webtor.io site for a direct URL link for a given magnet link.
-    Returns a Result containing either the URL string or an error message.
-    """
-    try:
-        tqdm.write(f"🌐 Fetching Webtor URL for: {title[:20]}...")
-        page.goto("https://webtor.io/", wait_until="domcontentloaded")
-
-        search_input = page.wait_for_selector('input[placeholder*="magnet" i]')
-        if not search_input:
-            msg = "FAILED: Magnet input not found"
-            tqdm.write(f"❌ Scrape error on {title}: {msg}")
-            return Err(msg)
-
-        search_input.fill(magnet)
-        search_input.press("Enter")
-
-        zip_btn = page.wait_for_selector("button:has-text('ZIP')", timeout=180000)
-        if not zip_btn:
-            msg = "FAILED: ZIP button not found"
-            tqdm.write(f"❌ Scrape error on {title}: {msg}")
-            return Err(msg)
-        zip_btn.click()
-
-        url_btn = page.wait_for_selector("a:text-is('URL')", timeout=100000)
-        if not url_btn:
-            msg = "FAILED: URL copy button not found"
-            tqdm.write(f"❌ Scrape error on {title}: {msg}")
-            return Err(msg)
-        url_btn.click()
-
-        time.sleep(2)
-        captured_url(page.evaluate("navigator.clipboard.readText()").strip()
-        if captured_url and captured_url.startswith("http"):
-            return Ok(captured_url)
-        else:
-            msg = "FAILED: Scraping Error (No valid URL captured)"
-            tqdm.write(f"❌ Failed to grab URL link for {title}")
-            return Err(msg)
-    except Exception as e:
-        msg = f"FAILED: Browser error ({type(e).__name__})"
-        tqdm.write(f"❌ Scrape error on {title}: {e}")
-        return Err(msg)
 
 
 def scrape_n_download(
@@ -457,8 +91,7 @@ def file(
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
     """use links inside a yaml file"""
-    global global_executor, global_target_folder
-    global_target_folder = os.path.expanduser(target_folder)
+    config.global_target_folder = os.path.expanduser(target_folder)
 
     all_entries = load_yaml(yaml_path)
     pending_items = get_pending_items(all_entries)
@@ -468,12 +101,14 @@ def file(
 
     tqdm.write(f"⚙️ Found {len(pending_items)} pending items.")
 
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-        global_executor = (
+    with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_DOWNLOADS) as executor:
+        config.global_executor = (
             executor  # Keep references accessible to asynchronous link re-grabs
         )
-        download_cached(pending_items, executor, global_target_folder, yaml_path)
-        scrape_n_download(pending_items, executor, global_target_folder, yaml_path)
+        download_cached(pending_items, executor, config.global_target_folder, yaml_path)
+        scrape_n_download(
+            pending_items, executor, config.global_target_folder, yaml_path
+        )
 
     tqdm.write("🏁 Processing finished.")
 
@@ -483,8 +118,7 @@ def link(
     magnet_link: str,
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
-    global global_executor, global_target_folder
-    global_target_folder = os.path.expanduser(target_folder)
+    config.global_target_folder = os.path.expanduser(target_folder)
 
     match = re.search("dn=(.+)&", magnet_link)
     name = unquote(match.group(1)).replace("+", " ") if match else "Manual Entry"
@@ -497,8 +131,8 @@ def link(
         browser.close()
     if download_link:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            global_executor = executor
-            run_aria2_download(download_link, global_target_folder, magnet_link)
+            config.global_executor = executor
+            run_aria2_download(download_link, config.global_target_folder, magnet_link)
     tqdm.write("🏁 Processing finished.")
 
 
