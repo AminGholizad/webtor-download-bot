@@ -1,5 +1,8 @@
 import os
 import re
+import socket
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import unquote
@@ -16,6 +19,60 @@ from scraper import get_browser_context, scrape_webtor_url
 from utils import load_yaml, update_yaml_field
 
 app = typer.Typer()
+
+
+def is_rpc_server_running() -> bool:
+    """Checks if the aria2 RPC port is currently open and responding."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        try:
+            s.connect((config.ARIA2_RPC_HOST, config.ARIA2_RPC_PORT))
+            return True
+        except (socket.timeout, ConnectionRefusedError):
+            return False
+
+
+def ensure_aria2_rpc_daemon():
+    """Checks for an active aria2 RPC server instance, spinning one up if missing."""
+    if is_rpc_server_running():
+        tqdm.write("ℹ️ aria2 RPC server is already running. Reusing active instance.")
+        return
+
+    tqdm.write("⚙️ aria2 RPC server not detected. Initializing daemon in background...")
+
+    aria_cmd = [
+        "aria2c",
+        "--enable-rpc",
+        f"--rpc-listen-port={config.ARIA2_RPC_PORT}",
+        "--rpc-listen-all=false",
+        f"--rpc-secret={config.ARIA2_RPC_SECRET}",
+        "--daemon=true",  # Automatically detaches the process to run cleanly in the background
+    ]
+
+    try:
+        # We use Popen so it runs independently without blocking the script execution line
+        subprocess.Popen(
+            aria_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # Keeps process alive even if parent script exits completely
+        )
+
+        # Give the background daemon a quick window to bind to the network socket port
+        for _ in range(5):
+            time.sleep(0.5)
+            if is_rpc_server_running():
+                tqdm.write(
+                    "⚡ aria2 RPC server successfully started and bound to port."
+                )
+                return
+
+        tqdm.write("❌ Critical: aria2 executable ran but port failed to open.")
+    except FileNotFoundError:
+        tqdm.write(
+            "❌ Error: 'aria2c' binary was not found on your system PATH. Please install it."
+        )
+        raise typer.Exit(code=1)
 
 
 def get_pending_items(all_entries) -> list[Any]:
@@ -91,6 +148,7 @@ def file(
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
     """use links inside a yaml file"""
+    ensure_aria2_rpc_daemon()  # Ensure server is up before doing work
     config.global_target_folder = os.path.expanduser(target_folder)
 
     all_entries = load_yaml(yaml_path)
@@ -118,6 +176,7 @@ def link(
     magnet_link: str,
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
+    ensure_aria2_rpc_daemon()  # Ensure server is up before doing work
     config.global_target_folder = os.path.expanduser(target_folder)
 
     match = re.search("dn=(.+)&", magnet_link)

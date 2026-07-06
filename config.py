@@ -6,7 +6,9 @@ from SlotManager import SlotManager
 
 # --- SETTINGS ---
 MAX_CONCURRENT_DOWNLOADS = 3
-ARIA2_RPC_URL = "http://localhost:6800/jsonrpc"
+ARIA2_RPC_HOST = "127.0.0.1"
+ARIA2_RPC_PORT = 6800
+ARIA2_RPC_URL = f"http://{ARIA2_RPC_HOST}:{ARIA2_RPC_PORT}/jsonrpc"
 ARIA2_RPC_SECRET = "your_secure_token_here"  # Match the token used to start aria2c
 # ----------------
 
