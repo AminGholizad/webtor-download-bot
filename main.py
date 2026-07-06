@@ -89,8 +89,8 @@ def update_yaml_field(
     yaml_path: str, magnet_link: str, updates: dict[str, str]
 ) -> None:
     """
-    Updates multiple fields (like status and curl_cmd) for a specific magnet.
-    'updates' should be a dictionary like {'status': 'DONE', 'curl_cmd': '...'}
+    Updates multiple fields (like status and download_url) for a specific magnet.
+    'updates' should be a dictionary like {'status': 'DONE', 'download_url': '...'}
     """
     if not yaml_path:
         return
@@ -372,7 +372,7 @@ def scrape_n_download(
 
                 match scrape_webtor_url(page, m, title):
                     case Ok(captured_url):
-                        # Save it under curl_cmd key to minimize rewriting the YAML architecture
+                        # Save it under download_url key to minimize rewriting the YAML architecture
                         if yaml_path:
                             update_yaml_field(
                                 yaml_path, m, {"download_url": captured_url}
