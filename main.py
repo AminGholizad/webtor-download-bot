@@ -22,6 +22,9 @@ MAX_CONCURRENT_DOWNLOADS = 3
 
 # Lock to prevent file corruption during parallel status updates
 file_modify_lock = threading.Lock()
+# Shared reference to the executor so we can re-queue refreshed items
+global_executor: Optional[ThreadPoolExecutor] = None
+global_target_folder: str = "~/Downloads"
 
 app = typer.Typer()
 
@@ -148,12 +151,53 @@ def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
 def get_filename_from_url(url: str) -> str:
     """Extracts a clean filename from the Webtor download URL."""
     try:
-        # Handles URL formats like https://.../filename.zip?token=...
-        path_part = url.split("?")[0]
-        filename = os.path.basename(path_part)
-        return unquote(filename)
+        clean_url = url.split("?")[0].split("#")[0]
+        filename = clean_url.rstrip("/").split("/")[-1]
+        decoded_filename = unquote(filename)
+        return decoded_filename if decoded_filename else "download.zip"
     except Exception:
         return "download.zip"
+
+
+def handle_expired_link(original_magnet: str, yaml_path: Optional[str] = None):
+    """Regrabs a fresh URL for a magnet that expired or timed out and queues it."""
+    global global_executor, global_target_folder
+    tqdm.write(f"🔄 Link expired or timed out. Refreshing token for magnet...")
+
+    with sync_playwright() as pl:
+        browser, page = get_browser_context(pl)
+        # Fallback tracking info
+        match = re.search("dn=(.+)&", original_magnet)
+        title = unquote(match.group(1)).replace("+", " ") if match else "Expired Item"
+
+        match scrape_webtor_url(page, original_magnet, title):
+            case Ok(fresh_url):
+                tqdm.write(f"✨ Fresh URL retrieved successfully for: {title[:20]}")
+                if yaml_path:
+                    update_yaml_field(
+                        yaml_path,
+                        original_magnet,
+                        {"curl_cmd": fresh_url, "status": "RETRIED"},
+                    )
+
+                # Re-submit the freshly pulled URL to the ongoing thread executor pool
+                if global_executor:
+                    global_executor.submit(
+                        run_aria2_download,
+                        fresh_url,
+                        global_target_folder,
+                        original_magnet,
+                        yaml_path,
+                    )
+            case Err(e):
+                tqdm.write(f"❌ Could not auto-refresh link: {e}")
+                if yaml_path:
+                    update_yaml_field(
+                        yaml_path,
+                        original_magnet,
+                        {"status": f"FAILED: Refresh failed ({e})"},
+                    )
+        browser.close()
 
 
 def run_aria2_download(
@@ -249,11 +293,26 @@ def run_aria2_download(
                     pbar.refresh()
 
         process.wait()
+        pbar.close()
+
         if process.returncode == 0:
             tqdm.write(f"✅ Downloaded: {download_filename}")
             extract_and_cleanup(full_path, pbar)
             if yaml_path:
                 update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
+
+        # Status code 19 = HTTP Status 4xx/5xx error (e.g. 401 Unauthorized / 403 Forbidden on expired tokens)
+        # Status code 24 = Authorization failed / Link timed out completely
+        elif process.returncode in [19, 24]:
+            tqdm.write(
+                f"⚠️ Link validation failed (Code {process.returncode}) for {download_filename}."
+            )
+            # Spawn a non-blocking background thread to grab a fresh link and append back into queue
+            threading.Thread(
+                target=handle_expired_link,
+                args=(original_magnet, yaml_path),
+                daemon=True,
+            ).start()
         else:
             if yaml_path:
                 update_yaml_field(
@@ -262,10 +321,8 @@ def run_aria2_download(
                     {"status": f"FAILED: aria2 Exit Code {process.returncode}"},
                 )
             tqdm.write(
-                f"\n⚠️ Download failed for {download_filename} (Exit Code: {process.returncode})"
+                f"\n❌ Download dropped permanently for {download_filename} (Code: {process.returncode})"
             )
-
-        pbar.close()
 
 
 def get_pending_items(all_entries) -> list[str]:
@@ -273,7 +330,7 @@ def get_pending_items(all_entries) -> list[str]:
     pending_items = [
         item
         for item in all_entries
-        if item.get("status") != "DONE" and item.get("magnet")
+        if item.get("status") not in ["DONE", "RETRIED"] and item.get("magnet")
     ]
     return pending_items
 
@@ -341,9 +398,9 @@ def scrape_webtor_url(page, magnet: str, title: str) -> Result[str, str]:
             return Err(msg)
         url_btn.click()
 
-        time.sleep(2)  # Safe clipboard buffer
-        captured_url = page.evaluate("navigator.clipboard.readText()").strip()
-        if captured_url.startswith("http"):
+        time.sleep(2)
+        captured_url(page.evaluate("navigator.clipboard.readText()").strip()
+        if captured_url and captured_url.startswith("http"):
             return Ok(captured_url)
         else:
             msg = "FAILED: Scraping Error (No valid URL captured)"
@@ -400,7 +457,9 @@ def file(
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
     """use links inside a yaml file"""
-    target_folder = os.path.expanduser(target_folder)
+    global global_executor, global_target_folder
+    global_target_folder = os.path.expanduser(target_folder)
+
     all_entries = load_yaml(yaml_path)
     pending_items = get_pending_items(all_entries)
     if not pending_items:
@@ -409,10 +468,13 @@ def file(
 
     tqdm.write(f"⚙️ Found {len(pending_items)} pending items.")
 
-    # We use a Semaphore to limit active downloads and manage bar slots
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-        download_cached(pending_items, executor, target_folder, yaml_path)
-        scrape_n_download(pending_items, executor, target_folder, yaml_path)
+        global_executor = (
+            executor  # Keep references accessible to asynchronous link re-grabs
+        )
+        download_cached(pending_items, executor, global_target_folder, yaml_path)
+        scrape_n_download(pending_items, executor, global_target_folder, yaml_path)
+
     tqdm.write("🏁 Processing finished.")
 
 
@@ -421,7 +483,9 @@ def link(
     magnet_link: str,
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
-    target_folder = os.path.expanduser(target_folder)
+    global global_executor, global_target_folder
+    global_target_folder = os.path.expanduser(target_folder)
+
     match = re.search("dn=(.+)&", magnet_link)
     name = unquote(match.group(1)).replace("+", " ") if match else "Manual Entry"
     download_link = ""
@@ -432,7 +496,9 @@ def link(
                 download_link = captured_link
         browser.close()
     if download_link:
-        run_aria2_download(download_link, target_folder, magnet_link)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            global_executor = executor
+            run_aria2_download(download_link, global_target_folder, magnet_link)
     tqdm.write("🏁 Processing finished.")
 
 
