@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Any
 import time
 from playwright.sync_api import BrowserContext, Page, Playwright
@@ -7,13 +8,52 @@ from result import Err, Ok, Result
 from tqdm import tqdm
 
 
-def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
-    """Creates a configured browser context with stealth and clipboard permissions."""
-    context = pl.chromium.launch_persistent_context(
-        "./webtor_session",
-        headless=False,  # xvfb handles this
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+def get_browser_context(
+    pl: Playwright, max_wait_seconds: int = 300
+) -> tuple[BrowserContext, Page]:
+    """
+    Creates a configured browser context with stealth and clipboard permissions.
+    If the session directory is locked by another script instance, it will wait
+    until it is released or the timeout is reached.
+    """
+    start_time = time.time()
+
+    while True:
+        try:
+            context = pl.chromium.launch_persistent_context(
+                "./webtor_session",
+                headless=False,  # xvfb handles this
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            # If successful, break out of the retry loop
+            break
+        except Exception as e:
+            # Check if the error message indicates a locked profile folder
+            error_msg = str(e).lower()
+            if (
+                "profile already in use" in error_msg
+                or "lock" in error_msg
+                or "target closed" in error_msg
+            ):
+                elapsed = int(time.time() - start_time)
+                if elapsed >= max_wait_seconds:
+                    print(
+                        f"\n❌ Critical: Playwright session directory remained locked for over {max_wait_seconds}s. Exiting."
+                    )
+                    raise e
+
+                print(
+                    f"⏳ Session profile folder is currently locked by another instance. Retrying in 5 seconds... ({elapsed}s elapsed)",
+                    end="\r",
+                )
+                time.sleep(5)
+            else:
+                # If it's a completely unrelated Playwright crash, raise it immediately
+                raise e
+
+    print(
+        "🔓 Acquired browser session lock successfully.                        "
+    )  # Clear the trailing carriage return text
     context.grant_permissions(["clipboard-read", "clipboard-write"])
     page = context.pages[0]
     Stealth().apply_stealth_sync(page)
