@@ -1,6 +1,6 @@
 import os
 import shutil
-import time
+import threading
 from typing import Any
 import time
 from playwright.sync_api import BrowserContext, Page, Playwright
@@ -9,87 +9,39 @@ from result import Err, Ok, Result
 from tqdm import tqdm
 
 
-def clear_stale_locks(profile_dir: str = "./webtor_session"):
+def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
     """
-    Checks for and removes stale lock files left behind by unexpected crashes
-    if no active chrome/chromium process is running.
+    Creates a unique, isolated browser context per running worker thread.
+    This completely prevents ProcessSingleton lock collisions during concurrent token refreshes.
     """
-    if not os.path.exists(profile_dir):
-        return
+    # Create an isolated path using both Process ID and Thread ID
+    pid = os.getpid()
+    tid = threading.get_ident()
+    unique_profile_path = os.path.abspath(f"./webtor_session_{pid}_{tid}")
 
-    # Files Chromium uses to mark a profile directory as 'active'
-    lock_files = ["SingletonLock", "lock", "LOCK"]
+    try:
+        context = pl.chromium.launch_persistent_context(
+            unique_profile_path,
+            headless=False,  # xvfb handles this
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+    except Exception as e:
+        tqdm.write(f"❌ Failed to initialize unique browser session: {e}")
+        raise e
 
-    for filename in lock_files:
-        lock_path = os.path.join(profile_dir, filename)
-        if os.path.exists(lock_path) or os.path.islink(lock_path):
-            try:
-                # Attempt to remove the file/symlink.
-                # If an active process has an open file handle on it, this will usually fail or block on Windows,
-                # but on Linux/macOS we do this carefully.
-                if os.path.islink(lock_path):
-                    os.unlink(lock_path)
-                else:
-                    os.remove(lock_path)
-                print(f"🗑️ Cleaned up stale crash lock file: {lock_path}")
-            except Exception:
-                # If we can't delete it, an active script is legitimately using it right now.
-                pass
+    # Inject a custom cleanup handler so the isolated folder drops off disk when closed
+    original_close = context.close
 
-
-def get_browser_context(
-    pl: Playwright, max_wait_seconds: int = 300
-) -> tuple[BrowserContext, Page]:
-    """
-    Creates a configured browser context with stealth and clipboard permissions.
-    Safely clears stale crash locks or waits if another instance is actively running.
-    """
-    profile_path = "./webtor_session"
-    start_time = time.time()
-
-    # First, attempt to clear locks that were left abandoned by a previous crash
-    clear_stale_locks(profile_path)
-
-    while True:
+    def custom_close_and_cleanup():
+        original_close()
         try:
-            context = pl.chromium.launch_persistent_context(
-                profile_path,
-                headless=False,  # xvfb handles this
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            # If successful, break out of the retry loop
-            break
-        except Exception as e:
-            # Check if the error message indicates a locked profile folder
-            error_msg = str(e).lower()
-            if (
-                "profile already in use" in error_msg
-                or "lock" in error_msg
-                or "target closed" in error_msg
-            ):
-                elapsed = int(time.time() - start_time)
-                if elapsed >= max_wait_seconds:
-                    print(
-                        f"\n❌ Critical: Playwright session directory remained locked for over {max_wait_seconds}s. Exiting."
-                    )
-                    raise e
+            if os.path.exists(unique_profile_path):
+                shutil.rmtree(unique_profile_path)
+        except Exception:
+            pass  # Fail silently if files are momentarily held by OS exit structures
 
-                # Every few iterations, try clearing the locks again in case an instance just closed
-                if elapsed % 15 == 0:
-                    clear_stale_locks(profile_path)
+    context.close = custom_close_and_cleanup
 
-                print(
-                    f"⏳ Session profile folder is currently locked by another instance. Retrying in 5 seconds... ({elapsed}s elapsed)",
-                    end="\r",
-                )
-                time.sleep(5)
-            else:
-                # If it's a completely unrelated Playwright crash, raise it immediately
-                raise e
-
-    print(
-        "🔓 Acquired browser session lock successfully.                        "
-    )  # Clear the trailing carriage return text
     context.grant_permissions(["clipboard-read", "clipboard-write"])
     page = context.pages[0]
     Stealth().apply_stealth_sync(page)
