@@ -111,76 +111,109 @@ def run_aria2_download(
         # RPC Options setup (Tells aria2 where to store the specific files)
         options = {"dir": target_dir, "out": download_filename, "continue": "true"}
 
-        try:
-            # Tell aria2 to add the direct HTTP URI download download assignment
-            gid = call_aria2_rpc("aria2.addUri", [[download_url], options])
-        except Exception as e:
-            if yaml_path:
-                update_yaml_field(
-                    yaml_path, original_magnet, {"status": f"FAILED: RPC Startup Error"}
-                )
-            tqdm.write(f"❌ RPC failed to add download: {e}")
-            pbar.close()
-            return
-
-        # Status polling loop
+        max_retries = 10
+        retry_count = 0
         error_triggered = False
+
         while True:
-            time.sleep(1)  # Poll status updates every 1 second
             try:
-                status_info = call_aria2_rpc("aria2.tellStatus", [gid])
+                # Tell aria2 to add the direct HTTP URI download download assignment
+                gid = call_aria2_rpc("aria2.addUri", [[download_url], options])
             except Exception as e:
-                tqdm.write(f"⚠️ Failed to poll RPC status for {download_filename}: {e}")
-                continue
-
-            status = status_info.get("status")
-            total_length = int(status_info.get("totalLength", 0))
-            completed_length = int(status_info.get("completedLength", 0))
-
-            if total_length > 0:
-                pbar.total = total_length
-                pbar.n = completed_length
-                pbar.refresh()
-
-            if status == "complete":
-                break
-
-            elif status == "error":
-                error_code = int(status_info.get("errorCode", 0))
-                # Error code 1 = An unknown error occurred / stream dropped
-                # Error code 22 = HTTP response status code was unacceptable (401/403/Expired token)
-                if error_code in [1, 22]:
-                    tqdm.write(
-                        f"⚠️ Link validation failed via RPC (Code {error_code}) for {download_filename}."
-                    )
-                    # Clean up the broken task from the daemon's stack
-                    try:
-                        call_aria2_rpc("aria2.removeDownloadResult", [gid])
-                    except Exception:
-                        pass
-
-                    threading.Thread(
-                        target=handle_expired_link,
-                        args=(original_magnet, yaml_path),
-                        daemon=True,
-                    ).start()
-                    error_triggered = True
+                if retry_count < max_retries:
+                    retry_count += 1
+                    tqdm.write(f"⚠️ RPC failed to add download for {download_filename}: {e}. Retrying ({retry_count}/{max_retries})...")
+                    time.sleep(2)
+                    continue
                 else:
                     if yaml_path:
                         update_yaml_field(
-                            yaml_path,
-                            original_magnet,
-                            {"status": f"FAILED: aria2 RPC Error Code {error_code}"},
+                            yaml_path, original_magnet, {"status": f"FAILED: RPC Startup Error"}
                         )
-                    tqdm.write(
-                        f"\n❌ Download dropped permanently for {download_filename} (RPC Code: {error_code})"
-                    )
+                    tqdm.write(f"❌ RPC failed to add download: {e}")
+                    pbar.close()
+                    return
+
+            # Status polling loop
+            attempt_failed = False
+            while True:
+                time.sleep(1)  # Poll status updates every 1 second
+                try:
+                    status_info = call_aria2_rpc("aria2.tellStatus", [gid])
+                except Exception as e:
+                    tqdm.write(f"⚠️ Failed to poll RPC status for {download_filename}: {e}")
+                    continue
+
+                status = status_info.get("status")
+                total_length = int(status_info.get("totalLength", 0))
+                completed_length = int(status_info.get("completedLength", 0))
+
+                if total_length > 0:
+                    pbar.total = total_length
+                    pbar.n = completed_length
+                    pbar.refresh()
+
+                if status == "complete":
+                    break
+
+                elif status == "error":
+                    error_code = int(status_info.get("errorCode", 0))
+                    # Error code 1 = An unknown error occurred / stream dropped
+                    # Error code 22 = HTTP response status code was unacceptable (401/403/Expired token)
+                    if error_code in [1, 22]:
+                        tqdm.write(
+                            f"⚠️ Link validation failed via RPC (Code {error_code}) for {download_filename}."
+                        )
+                        # Clean up the broken task from the daemon's stack
+                        try:
+                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                        except Exception:
+                            pass
+
+                        threading.Thread(
+                            target=handle_expired_link,
+                            args=(original_magnet, yaml_path),
+                            daemon=True,
+                        ).start()
+                        error_triggered = True
+                        break
+                    else:
+                        # Clean up the broken task from the daemon's stack
+                        try:
+                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                        except Exception:
+                            pass
+
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            tqdm.write(
+                                f"⚠️ Download failed for {download_filename} (RPC Code: {error_code}). Retrying ({retry_count}/{max_retries})..."
+                            )
+                            time.sleep(2)
+                            attempt_failed = True
+                            break
+                        else:
+                            if yaml_path:
+                                update_yaml_field(
+                                    yaml_path,
+                                    original_magnet,
+                                    {"status": f"FAILED: aria2 RPC Error Code {error_code}"},
+                                )
+                            tqdm.write(
+                                f"\n❌ Download dropped permanently for {download_filename} (RPC Code: {error_code})"
+                            )
+                            error_triggered = True
+                            break
+
+                elif status == "removed":
                     error_triggered = True
+                    break
+
+            if error_triggered or status == "complete":
                 break
 
-            elif status == "removed":
-                error_triggered = True
-                break
+            if attempt_failed:
+                continue
 
         pbar.close()
 
