@@ -60,6 +60,10 @@ def extract_and_cleanup(zip_path: str, pbar: tqdm) -> None:
         pbar.write(f"❌ Extraction failed: {zip_path} not found.")
         return
 
+    if not zipfile.is_zipfile(zip_path):
+        pbar.write(f"ℹ️ Downloaded file is not a ZIP archive. Skipping extraction: {zip_path}")
+        return
+
     # Create a folder name based on the zip name (without .zip)
     extract_to = zip_path.rsplit(".", 1)[0]
     pbar.set_description(f"📦 Unzipping: {os.path.basename(extract_to)[:15]}")
