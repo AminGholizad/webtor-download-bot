@@ -43,6 +43,38 @@ def get_browser_context(pl: Playwright) -> tuple[BrowserContext, Page]:
     context.close = custom_close_and_cleanup
 
     context.grant_permissions(["clipboard-read", "clipboard-write"])
+    
+    # Intercept copy operations (both modern clipboard API and execCommand)
+    context.add_init_script("""
+        window._copiedText = "";
+        if (navigator.clipboard) {
+            const originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+            navigator.clipboard.writeText = async (text) => {
+                window._copiedText = text;
+                try {
+                    return await originalWriteText(text);
+                } catch (e) {
+                    // Ignore DOMExceptions under headless / unfocused browsers
+                }
+            };
+        }
+        const originalExecCommand = document.execCommand;
+        document.execCommand = function(command, showUI, value) {
+            if (command === 'copy') {
+                const activeEl = document.activeElement;
+                if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+                    window._copiedText = activeEl.value;
+                } else {
+                    const sel = window.getSelection();
+                    if (sel) {
+                        window._copiedText = sel.toString();
+                    }
+                }
+            }
+            return originalExecCommand.apply(this, arguments);
+        };
+    """)
+
     page = context.pages[0]
     Stealth().apply_stealth_sync(page)
     return context, page
@@ -81,7 +113,19 @@ def scrape_webtor_url(page: Page, magnet: str, title: str) -> Result[str, str]:
         url_btn.click()
 
         time.sleep(2) # Safe clipboard buffer
-        captured_url = page.evaluate("navigator.clipboard.readText()").strip()
+        
+        # Read the intercepted copied URL using a safe evaluation function
+        captured_url = page.evaluate("""async () => {
+            if (window._copiedText) {
+                return window._copiedText;
+            }
+            try {
+                if (navigator.clipboard && navigator.clipboard.readText) {
+                    return await navigator.clipboard.readText();
+                }
+            } catch (e) {}
+            return "";
+        }""").strip()
 
         if captured_url and captured_url.startswith("http"):
             return Ok(captured_url)
