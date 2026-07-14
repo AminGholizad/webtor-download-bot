@@ -80,7 +80,7 @@ def get_pending_items(all_entries) -> list[Any]:
     pending_items = [
         item
         for item in all_entries
-        if item.get("status") not in ["DONE", "RETRIED"] and item.get("magnet")
+        if item.get("status") != "DONE" and item.get("magnet")
     ]
     return pending_items
 
@@ -148,6 +148,10 @@ def file(
     target_folder: Annotated[str, typer.Option("--target", "-t")] = "~/Downloads",
 ):
     """use links inside a yaml file"""
+    if not os.path.exists(yaml_path):
+        tqdm.write(f"❌ Error: File not found: {yaml_path}")
+        raise typer.Exit(code=1)
+
     ensure_aria2_rpc_daemon()  # Ensure server is up before doing work
     config.global_target_folder = os.path.expanduser(target_folder)
 
@@ -179,7 +183,7 @@ def link(
     ensure_aria2_rpc_daemon()  # Ensure server is up before doing work
     config.global_target_folder = os.path.expanduser(target_folder)
 
-    match = re.search("dn=(.+)&", magnet_link)
+    match = re.search(r"dn=([^&]+)", magnet_link)
     name = unquote(match.group(1)).replace("+", " ") if match else "Manual Entry"
     download_link = ""
     with sync_playwright() as p:
