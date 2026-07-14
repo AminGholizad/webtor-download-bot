@@ -41,85 +41,51 @@ def call_aria2_rpc(method: str, params: list) -> Any:
         raise Exception(f"RPC Connection Error: {e}")
 
 
-def handle_expired_link(original_magnet: str, yaml_path: Optional[str] = None):
-    """Regrabs a fresh URL for a magnet that expired or timed out and queues it."""
-    tqdm.write(f"🔄 Link expired or timed out. Refreshing token for magnet...")
-
-    with sync_playwright() as pl:
-        browser, page = get_browser_context(pl)
-        # Fallback tracking info
-        match = re.search("dn=(.+)&", original_magnet)
-        title = unquote(match.group(1)).replace("+", " ") if match else "Expired Item"
-
-        match scrape_webtor_url(page, original_magnet, title):
-            case Ok(fresh_url):
-                tqdm.write(f"✨ Fresh URL retrieved successfully for: {title[:20]}")
-                if yaml_path:
-                    update_yaml_field(
-                        yaml_path,
-                        original_magnet,
-                        {"download_url": fresh_url, "status": "RETRIED"},
-                    )
-
-                # Re-submit the freshly pulled URL to the ongoing thread executor pool
-                if config.global_executor:
-                    config.global_executor.submit(
-                        run_aria2_download,
-                        fresh_url,
-                        config.global_target_folder,
-                        original_magnet,
-                        yaml_path,
-                    )
-            case Err(e):
-                tqdm.write(f"❌ Could not auto-refresh link: {e}")
-                if yaml_path:
-                    update_yaml_field(
-                        yaml_path,
-                        original_magnet,
-                        {"status": f"FAILED: Refresh failed ({e})"},
-                    )
-        browser.close()
-
-
 def run_aria2_download(
     download_url: str,
     target_dir: str,
     original_magnet: str,
     yaml_path: Optional[str] = None,
 ):
-    with config.slot_manager as slot:
-        target_dir = os.path.abspath(target_dir)
-        os.makedirs(target_dir, exist_ok=True)
+    current_url = download_url
+    target_dir = os.path.abspath(target_dir)
+    os.makedirs(target_dir, exist_ok=True)
 
-        download_filename = get_filename_from_url(download_url)
-        full_path = os.path.join(target_dir, download_filename)
-        # Initialize TQDM bar for this specific download
-        # position=slot + 1 to leave room for general logs at the top
-        # UI SETUP:
-        # We use unit="B" and unit_scale=True so tqdm handles K, M, G suffixes automatically
-        pbar = tqdm(
-            total=100,
-            desc=f"🚀 {download_filename[:20]}",
-            unit="B",
-            unit_scale=True,
-            position=slot + 1,
-            leave=False,
-            dynamic_ncols=True,
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
-        )
+    max_retries = 10
+    retry_count = 0
 
-        # RPC Options setup (Tells aria2 where to store the specific files)
-        options = {"dir": target_dir, "out": download_filename, "continue": "true"}
-
-        max_retries = 10
-        retry_count = 0
+    while True:
+        need_refresh = False
         error_triggered = False
+        completed = False
+        gid = None
+        pbar = None
 
-        while True:
+        with config.slot_manager as slot:
+            download_filename = get_filename_from_url(current_url)
+            full_path = os.path.join(target_dir, download_filename)
+
+            # Initialize TQDM bar for this specific download
+            # position=slot + 1 to leave room for general logs at the top
+            pbar = tqdm(
+                total=100,
+                desc=f"🚀 {download_filename[:20]}",
+                unit="B",
+                unit_scale=True,
+                position=slot + 1,
+                leave=False,
+                dynamic_ncols=True,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]",
+            )
+
+            # RPC Options setup (Tells aria2 where to store the specific files)
+            options = {"dir": target_dir, "out": download_filename, "continue": "true"}
+
             try:
-                # Tell aria2 to add the direct HTTP URI download download assignment
-                gid = call_aria2_rpc("aria2.addUri", [[download_url], options])
+                # Tell aria2 to add the direct HTTP URI download assignment
+                gid = call_aria2_rpc("aria2.addUri", [[current_url], options])
             except Exception as e:
+                pbar.close()
                 if retry_count < max_retries:
                     retry_count += 1
                     tqdm.write(f"⚠️ RPC failed to add download for {download_filename}: {e}. Retrying ({retry_count}/{max_retries})...")
@@ -128,10 +94,9 @@ def run_aria2_download(
                 else:
                     if yaml_path:
                         update_yaml_field(
-                            yaml_path, original_magnet, {"status": f"FAILED: RPC Startup Error"}
+                            yaml_path, original_magnet, {"status": "FAILED: RPC Startup Error"}
                         )
                     tqdm.write(f"❌ RPC failed to add download: {e}")
-                    pbar.close()
                     return
 
             # Status polling loop
@@ -150,44 +115,36 @@ def run_aria2_download(
 
                 if total_length > 0:
                     pbar.total = total_length
-                    pbar.n = completed_length
-                    pbar.refresh()
+                    diff = completed_length - pbar.n
+                    if diff > 0:
+                        pbar.update(diff)
 
                 if status == "complete":
+                    completed = True
                     break
 
                 elif status == "error":
                     error_code = int(status_info.get("errorCode", 0))
+                    # Clean up the broken task from the daemon's stack
+                    try:
+                        call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                    except Exception:
+                        pass
+
                     # Error code 1 = An unknown error occurred / stream dropped
                     # Error code 22 = HTTP response status code was unacceptable (401/403/Expired token)
                     if error_code in [1, 22]:
                         tqdm.write(
                             f"⚠️ Link validation failed via RPC (Code {error_code}) for {download_filename}."
                         )
-                        # Clean up the broken task from the daemon's stack
-                        try:
-                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
-                        except Exception:
-                            pass
-
-                        threading.Thread(
-                            target=handle_expired_link,
-                            args=(original_magnet, yaml_path),
-                            daemon=True,
-                        ).start()
+                        need_refresh = True
                         error_triggered = True
                         break
                     else:
-                        # Clean up the broken task from the daemon's stack
-                        try:
-                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
-                        except Exception:
-                            pass
-
                         if retry_count < max_retries:
                             retry_count += 1
                             tqdm.write(
-                                f"⚠️ Download failed for {download_filename} (RPC Code: {error_code}). Retrying ({retry_count}/{max_retries})..."
+                                f"⚠️ Download failed for {download_filename} (RPC Code: {error_code}). Retrying ({retry_count}/{max_retries})...."
                             )
                             time.sleep(2)
                             attempt_failed = True
@@ -209,22 +166,57 @@ def run_aria2_download(
                     error_triggered = True
                     break
 
-            if error_triggered or status == "complete":
-                break
-
             if attempt_failed:
+                pbar.close()
                 continue
 
-        pbar.close()
+            if completed:
+                tqdm.write(f"✅ Downloaded: {download_filename}")
+                extract_and_cleanup(full_path, pbar)
+                pbar.close()
+                if yaml_path:
+                    update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
 
-        if not error_triggered:
-            tqdm.write(f"✅ Downloaded: {download_filename}")
-            extract_and_cleanup(full_path, pbar)
-            if yaml_path:
-                update_yaml_field(yaml_path, original_magnet, {"status": "DONE"})
+                # Clean complete job list footprint from the server session allocation map
+                try:
+                    call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                except Exception:
+                    pass
+                return
 
-            # Clean complete job list footprint from the server session allocation map
-            try:
-                call_aria2_rpc("aria2.removeDownloadResult", [gid])
-            except Exception:
-                pass
+            pbar.close()
+
+            if error_triggered and not need_refresh:
+                return
+
+        # Outside the SlotManager context: release slot while scraping fresh URL
+        if need_refresh:
+            tqdm.write(f"🔄 Link expired or timed out. Refreshing token for magnet...")
+            with sync_playwright() as pl:
+                browser, page = get_browser_context(pl)
+                match = re.search(r"dn=([^&]+)", original_magnet)
+                title = unquote(match.group(1)).replace("+", " ") if match else "Expired Item"
+
+                scrape_result = scrape_webtor_url(page, original_magnet, title)
+                browser.close()
+
+            match scrape_result:
+                case Ok(fresh_url):
+                    tqdm.write(f"✨ Fresh URL retrieved successfully for: {title[:20]}")
+                    if yaml_path:
+                        update_yaml_field(
+                            yaml_path,
+                            original_magnet,
+                            {"download_url": fresh_url},
+                        )
+                    current_url = fresh_url
+                    continue
+                case Err(e):
+                    tqdm.write(f"❌ Could not auto-refresh link: {e}")
+                    if yaml_path:
+                        update_yaml_field(
+                            yaml_path,
+                            original_magnet,
+                            {"status": f"FAILED: Refresh failed ({e})"},
+                        )
+                    return
