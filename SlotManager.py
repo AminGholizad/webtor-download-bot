@@ -10,7 +10,7 @@ class SlotManager:
         self.lock = threading.Lock()
         self._local = threading.local()
 
-    def aquire(self):
+    def acquire(self):
         """Acquires a slot. Returns the slot index."""
         with self.lock:
             for i, occupied in enumerate(self.slots):
@@ -18,8 +18,8 @@ class SlotManager:
                     self.slots[i] = True
                     self._local.slot = i
                     return i
-        # Fallback to 0 if all slots are somehow full
-        self._local.slot = 0
+        # Fallback to None if all slots are full, don't claim ownership of any slot
+        self._local.slot = None
         return 0
 
     def release(self):
@@ -32,7 +32,7 @@ class SlotManager:
             del self._local.slot
 
     def __enter__(self):
-        return self.aquire()
+        return self.acquire()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release()
